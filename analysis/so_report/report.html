@@ -1,0 +1,29 @@
+<!doctype html><html><head><meta charset="utf-8"><title>SO Scan ObsTable</title>
+<style>body{font-family:system-ui,sans-serif;max-width:1150px;margin:2em auto;padding:0 16px;
+line-height:1.45} img{max-width:100%;border:1px solid #ddd} table{border-collapse:collapse}
+th,td{padding:3px 10px;border-bottom:1px solid #eee;text-align:left} figure{margin:2em 0}
+figcaption{color:#444} code{background:#f4f4f4}
+</style></head><body>
+<h1>Simons Observatory scan-based ObsTable</h1>
+<p>SO scans continuously in azimuth at fixed elevation, so instead of discrete pointings we simulate one
+sidereal day of the idealized scan, accumulate per-pixel hit and mean-time maps for every optics tube with
+<code>pixell</code>, and materialize them into a standard <code>ObsTable</code> with one row per
+(tube, observed pixel, day). Source queries map the source to its pixel, so the normal
+<code>simulate_lightcurves</code> path is used unchanged.</p>
+<h2>Model assumptions</h2>
+<ul>
+<li>Site 22&deg;57'31"S 67&deg;47'15"W; boresight elevation 40&deg;; azimuth triangle wave at 1&deg;/s with
+instantaneous turnarounds.</li>
+<li>Schedule alternates east (az 30&ndash;150&deg;) and west (az 210&ndash;330&deg;) blocks, phased in LST,
+so the pattern repeats every sidereal day. <b>The real SO block schedule is still to be decided.</b></li>
+<li>Each pixel is observed at most once per tube per day: if crossed in both ranges, only the crossing with
+more hits is kept. Row time is the hit-weighted (circular) mean of that crossing.</li>
+<li>13 tubes, 1.25&deg; field of view, 1.75&deg; hex spacing with half the outer ring missing; generic
+filter labels (8 MF, 4 UHF, 1 LF) to be replaced by the real mapping.</li>
+<li>No refraction, precession, sun/moon avoidance, weather, or turnaround overhead.</li>
+<li>The az 30&ndash;150&deg; / 210&ndash;330&deg; throws limit coverage to roughly Dec &minus;59&deg; to
++21&deg; (plus tube offsets), narrower than the full 40&deg;-elevation ring (&minus;73&deg; to +27&deg;).</li>
+</ul>
+<h2>Run summary</h2><table><tr><th>Mode</th><td>full</td></tr><tr><th>Resolution (deg)</th><td>0.5</td></tr><tr><th>Sample interval (s)</th><td>0.25</td></tr><tr><th>Detector grid spacing (deg)</th><td>0.3125</td></tr><tr><th>Block length (h)</th><td>1.0</td></tr><tr><th>Tubes</th><td>0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12</td></tr><tr><th>Start / days</th><td>2026-10-14 / 7</td></tr><tr><th>ObsTable rows</th><td>8,476,486</td></tr><tr><th>Observed Dec range (deg)</th><td>-63.2 to 24.2</td></tr><tr><th>Median exposure per tube-day (s)</th><td>4.11</td></tr><tr><th>East / west fraction</th><td>0.52/0.48</td></tr></table>
+<figure><h3>Tube layout</h3><img src='layout.png'><figcaption>Hex focal plane; circles are 1.25&deg; fields of view.</figcaption></figure><figure><h3>Observation-time maps</h3><img src='time.png'><figcaption>Mean LST of each pixel's single daily crossing.</figcaption></figure><figure><h3>Scan side</h3><img src='side.png'><figcaption>Which azimuth range observed each pixel (east = rising, west = setting).</figcaption></figure><figure><h3>Exposure maps</h3><img src='exposure.png'><figcaption>Seconds per day that each pixel spends inside the tube FoV.</figcaption></figure><figure><h3>Coverage union</h3><img src='coverage.png'><figcaption>Number of tubes that observe each pixel in a day.</figcaption></figure><figure><h3>ObsTable checks</h3><img src='table_checks.png'><figcaption>Left: every (tube, pixel, day) has exactly one row. Right: cadence.</figcaption></figure><figure><h3>Previous implementation (for comparison)</h3><img src='before.png'><figcaption>Analytic model output.</figcaption></figure>
+</body></html>

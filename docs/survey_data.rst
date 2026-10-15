@@ -78,6 +78,55 @@ Argus Data (ArgusObsTable)
 -------------------------------------------------------------------------------
 The ``ArgusObsTable`` class stores pointing and noise information from simulations of the upcoming `Argus Array <https://www.argusarray.org/>`__. This class is still being validated and may change. Please contact the LightCurveLynx team if you want to use this class or have suggestions for improvement.
 
+Simons Observatory (SimonsObservatoryObsTable)
+-------------------------------------------------------------------------------
+The Simons Observatory (SO) scans continuously in azimuth at a fixed elevation instead of taking
+discrete pointings. ``simulate_time_maps`` simulates one sidereal day of an idealized scan and,
+using `pixell <https://github.com/simonsobs/pixell>`__, accumulates per-pixel hit counts and mean
+observation times for each of the 13 optics tubes. ``SimonsObservatoryObsTable.from_time_maps``
+then materializes those maps into a standard ``ObsTable`` with one row per (tube, observed
+pixel, day). ``ra``/``dec`` are the pixel center and ``time`` is the hit-weighted mean time of the
+crossing. The extra columns ``tube_id``, ``side`` (``east``/``west``), ``hits`` and ``exposure_s``
+(seconds the pixel spends in the tube's field of view) can drive a noise model. A source matches
+exactly the rows of the map pixel that contains it, so the standard ``simulate_lightcurves`` path
+is used.
+
+The idealized scan model:
+
+* The site is at 22d57m31s S, 67d47m15s W, and the boresight is fixed at 40 deg elevation.
+* Azimuth sweeps at 1 deg/s, with instantaneous turnarounds.
+* The scan alternates between an east range (az 30-150 deg) and a west range (az 210-330 deg) in
+  blocks of ``block_hours``, phased in LST. The pattern therefore repeats every sidereal day, and
+  only one day needs to be simulated.
+* Each pixel is observed at most once per tube per day. If a pixel is crossed in both ranges,
+  only the crossing with more hits is kept.
+* There are 13 tubes in a hex pattern: 1.25 deg fields of view, 1.75 deg spacing, and half the
+  outer ring missing. Filter labels are generic (8 ``MF``, 4 ``UHF``, 1 ``LF``); pass
+  ``filter_names`` once the real mapping is known.
+* Refraction, precession, sun/moon avoidance, weather and turnaround overheads are ignored.
+
+Because of the azimuth throws, coverage spans roughly Dec -59 to +21 deg, plus the tube offsets.
+
+.. code-block:: python
+
+    from lightcurvelynx.obstable.simons_observatory_obstable import (
+        SimonsObservatoryObsTable,
+        simulate_time_maps,
+        write_time_maps,
+    )
+
+    time_maps = simulate_time_maps(res_deg=0.5, block_hours=1.0)  # all 13 tubes
+    write_time_maps("so_time_maps.fits", time_maps)  # reload with read_time_maps
+    table = SimonsObservatoryObsTable.from_time_maps(time_maps, "2026-01-01", n_days=30, tubes=[0])
+    table.add_column("bandflux_error", sigma_1s / np.sqrt(table["exposure_s"]))
+    survey = SurveyInfo(table, passbands=passbands, noise_model=GivenNoiseModel())
+
+Building a table for all tubes over a long survey at fine resolution can produce a very large
+table. Build one table per tube (or per band) and keep the resolution at roughly 0.5 deg or
+coarser. ``analysis/visualize_simons_observatory_obstable.py`` (use ``--debug`` for a quick run)
+simulates the maps, builds the table, and writes an HTML report of diagnostic plots to
+``analysis/so_report/``.
+
 
 All Sky Simulations
 -------------------------------------------------------------------------------
