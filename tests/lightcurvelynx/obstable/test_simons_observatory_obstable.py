@@ -54,17 +54,15 @@ def test_tube_layout():
 
 
 def test_boresight_schedule():
-    """The boresight scans each azimuth range at the scan speed and alternates by block."""
+    """The boresight scans the requested azimuth range at the scan speed."""
     t = np.arange(0.0, 4 * 3600.0, 0.5)
-    az, el, side = boresight_azel(
-        t, elevation_deg=40.0, az_ranges=((30, 150), (210, 330)), speed_deg_s=1.0, block_hours=1.0
-    )
-    assert np.all(el == 40.0)
-    assert np.array_equal(side, (t // 3600).astype(int) % 2)
-    assert np.all((az[side == 0] >= 30) & (az[side == 0] <= 150))
-    assert np.all((az[side == 1] >= 210) & (az[side == 1] <= 330))
-    steps = np.abs(np.diff(az))[np.diff(side) == 0]
-    assert np.allclose(steps, 0.5)
+    for side, (low, high) in enumerate(((30, 150), (210, 330))):
+        az, el = boresight_azel(
+            t, side, elevation_deg=40.0, az_ranges=((30, 150), (210, 330)), speed_deg_s=1.0
+        )
+        assert np.all(el == 40.0)
+        assert np.all((az >= low) & (az <= high)) and az.min() == low and az.max() == high
+        assert np.allclose(np.abs(np.diff(az)), 0.5)
 
 
 def test_horizon_to_equatorial_matches_astropy():
@@ -84,18 +82,20 @@ def test_horizon_to_equatorial_matches_astropy():
 def test_time_map_coverage(time_maps):
     """Observed declinations match the analytic range of the az 30-150 / 210-330 scan."""
     maps = time_maps["maps"]
-    assert maps.shape[:2] == (len(MAP_FIELDS), 2)
+    assert maps.shape[:3] == (len(MAP_FIELDS), 2, 2)
     fields = dict(zip(MAP_FIELDS, maps, strict=True))
     observed = fields["hits"] > 0
     assert np.array_equal(observed, np.isfinite(fields["time_s"]))
-    assert np.all(fields["side"][observed] >= 0) and np.all(fields["side"][~observed] == -1)
+    # Rising and setting crossings of a pixel happen at different times.
+    both = observed[:, 0] & observed[:, 1]
+    assert np.all(fields["time_s"][:, 0][both] != fields["time_s"][:, 1][both])
     assert np.allclose(fields["exposure_s"], fields["hits"] * time_maps["dt_s"])
     assert np.all(fields["duration_s"][observed] >= fields["exposure_s"][observed])
     assert np.all(fields["n_passes"][observed] >= 1)
     time_s = fields["time_s"]
     assert np.all((time_s[observed] >= 0) & (time_s[observed] < SIDEREAL_DAY_S))
     dec = np.degrees(maps.posmap()[0])
-    for obs in observed:
+    for obs in observed.reshape(-1, *observed.shape[2:]):
         assert -63.0 < dec[obs].min() < -55.0
         assert 17.0 < dec[obs].max() < 25.0
 
@@ -116,13 +116,14 @@ def test_map_visits_match_point_trace(time_maps):
     rng = np.random.default_rng(4)
     for index, tube in enumerate(time_maps["tubes"]):
         observed = np.argwhere(fields["hits"][index] > 0)
-        for y, x in observed[rng.choice(len(observed), 10, replace=False)]:
-            side = fields["side"][index, y, x]
+        for side, y, x in observed[rng.choice(len(observed), 10, replace=False)]:
             visits = [v for v in point_visits(ra[y, x], dec[y, x], tube, **time_maps) if v["side"] == side]
-            visit = max(visits, key=lambda v: v["exposure_s"])
+            assert len(visits) == 1
             for key in ("duration_s", "exposure_s", "n_passes", "start_s"):
-                assert fields[key][index, y, x] == pytest.approx(visit[key], abs=0.01)
-            dt = (fields["time_s"][index, y, x] - visit["time_s"] + 0.5 * SIDEREAL_DAY_S) % SIDEREAL_DAY_S
+                assert fields[key][index, side, y, x] == pytest.approx(visits[0][key], abs=0.01)
+            dt = (
+                fields["time_s"][index, side, y, x] - visits[0]["time_s"] + 0.5 * SIDEREAL_DAY_S
+            ) % SIDEREAL_DAY_S
             assert dt == pytest.approx(0.5 * SIDEREAL_DAY_S, abs=0.01)
 
 
@@ -139,16 +140,32 @@ def test_table_pointing_matches_astropy(table):
     assert np.all((altaz.az.deg[~east] > 200) & (altaz.az.deg[~east] < 340))
 
 
-def test_table_one_observation_per_sidereal_day(table):
-    """Each (tube, pixel) is observed once per sidereal day, repeating exactly."""
+def test_table_alternates_rising_and_setting(time_maps, table):
+    """Each (tube, pixel) is seen once per sidereal day, alternating rising and setting crossings."""
     t0 = Time(START, scale="utc").mjd
     times = table["time"]
     assert times.min() >= t0 and times.max() < t0 + 3
     assert np.all(np.diff(times) >= 0)
-    for _, group in table._table.groupby(["tube_id", "pixel_index"]):
-        assert np.allclose(np.diff(group["time"]), SIDEREAL_DAY_S / 86400.0)
-    assert set(table.filters) == {"MF", "UHF"}
     df = table._table
+    assert np.all((df["side"] == "east") == (df["transit_day"] % 2 == 0))
+    # Where a tube sees both crossings, revisits are one sidereal day plus or minus the
+    # rising-to-setting offset (< 12 h); same-side revisits are exactly two sidereal days.
+    sidereal_day = SIDEREAL_DAY_S / 86400.0
+    for _, group in df.groupby(["tube_id", "pixel_index"]):
+        sides = group["side"].to_numpy()
+        if len(set(sides)) < 2:
+            continue
+        assert np.all(np.abs(np.diff(group["time"]) - sidereal_day) < 0.5)
+        assert np.all(np.diff(group["transit_day"]) == 1) and np.all(sides[1:] != sides[:-1])
+    for _, group in df.groupby(["tube_id", "pixel_index", "side"], observed=True):
+        assert np.allclose(np.diff(group["time"]), 2.0 * sidereal_day)
+    # Rising (east) crossings precede the pixel's meridian transit; setting crossings follow it.
+    lst = Time(df["time"].to_numpy(), format="mjd").sidereal_time("mean", longitude=SO_LONGITUDE_DEG).deg
+    hour_angle = (lst - df["ra"].to_numpy() + 180.0) % 360.0 - 180.0
+    assert np.all((hour_angle < 0) == (df["side"] == "east"))
+    west_first = SimonsObservatoryObsTable.from_time_maps(time_maps, START, 3, first_side=1)._table
+    assert np.all((west_first["side"] == "west") == (west_first["transit_day"] % 2 == 0))
+    assert set(table.filters) == {"MF", "UHF"}
     assert np.all((df["time_start"] <= df["time"]) & (df["time"] <= df["time_end"]))
     assert np.allclose((df["time_end"] - df["time_start"]) * 86400.0, df["duration_s"])
     assert set(df["side"]) <= set(SIDE_NAMES)
@@ -185,7 +202,7 @@ def test_time_map_io(time_maps, tmp_path):
     loaded = read_time_maps(fname)
     assert np.allclose(loaded["maps"], time_maps["maps"], equal_nan=True)
     assert np.array_equal(loaded["tubes"], time_maps["tubes"])
-    for key in ("res_deg", "dt_s", "block_hours", "elevation_deg", "az_ranges"):
+    for key in ("res_deg", "dt_s", "elevation_deg", "az_ranges"):
         assert np.allclose(loaded[key], time_maps[key])
 
 
@@ -203,7 +220,7 @@ def test_simulate_lightcurves(time_maps, passbands_dir):
         source, 1, survey, obstable_save_cols=["tube_id", "exposure_s", "pixel_index"], progress_bar=False
     )
     lightcurve = results["lightcurve"].iloc[0]
-    # The first crossing is at the start time, so 3 solar days hold 4 (sidereal) crossings.
-    assert len(lightcurve) == np.sum(table["pixel_index"] == row["pixel_index"]) == 4
+    # The first crossing is at the start time; 3 days hold 4 crossings, alternating rising/setting.
+    assert len(lightcurve) == np.sum(table["pixel_index"] == row["pixel_index"]) >= 2
     assert np.all(lightcurve["pixel_index"] == row["pixel_index"])
     assert np.allclose(lightcurve["fluxerr"], 10.0 / np.sqrt(lightcurve["exposure_s"]))

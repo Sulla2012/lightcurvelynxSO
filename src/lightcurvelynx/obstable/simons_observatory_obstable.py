@@ -2,21 +2,22 @@
 
 SO does not take discrete pointings: each optics tube (OT) scans continuously in azimuth at a
 fixed elevation while the sky drifts through the scan. We therefore simulate one sidereal day of
-an idealized scan strategy, accumulate per-pixel hit counts and mean observation times for each
-tube on a pixell CAR map, and materialize those maps into a standard ObsTable with one row per
-(day, observed pixel). Because the schedule is defined in local sidereal time (LST), the scan
-repeats every sidereal day, so a single simulated day is replicated for the full date range.
+scanning in each azimuth range, accumulate per-pixel hit counts and mean observation times for
+each tube and range on a pixell CAR map, and materialize those maps into a standard ObsTable with
+one row per (tube, day, observed pixel). Because the scan is defined in local sidereal time (LST),
+it repeats every sidereal day, so the simulated day is replicated for the full date range.
 
 Idealized scan model
 --------------------
 * Site at 22d57m31s S, 67d47m15s W; boresight elevation fixed at 40 deg.
-* The telescope alternates between an east (az 30-150 deg) and a west (az 210-330 deg) scan
-  range in blocks of ``block_hours``, phased so that the first block starts at LST = 0.
+* A patch is crossed once while rising, in the east range (az 30-150 deg), and once while
+  setting, in the west range (az 210-330 deg), around each meridian transit. SO switches daily
+  between the rising and the setting scan of a patch, so successive transits of a patch alternate
+  between its rising and its setting crossing.
 * Azimuth follows a triangle wave at 1 deg/s with instantaneous turnarounds.
 * 13 tubes of 1.25 deg diameter in a hex pattern (1.75 deg spacing, half the outer ring
   missing); 8 MF, 4 UHF, 1 LF. A pixel is hit whenever its center is inside a tube's FoV.
-* Each pixel is observed at most once per tube per sidereal day: if it is crossed in both the
-  east and west ranges only the crossing with more hits is kept.
+* Each pixel is therefore observed at most once per tube per sidereal day.
 """
 
 import numpy as np
@@ -34,15 +35,14 @@ SO_LATITUDE_DEG = -(22.0 + 57.0 / 60.0 + 31.0 / 3600.0)
 SO_LONGITUDE_DEG = -(67.0 + 47.0 / 60.0 + 15.0 / 3600.0)
 SO_TUBE_FILTERS = ("MF",) * 8 + ("UHF",) * 4 + ("LF",)
 SIDEREAL_DAY_S = 86164.0905
-MAP_FIELDS = ("hits", "time_s", "side", "start_s", "duration_s", "exposure_s", "n_passes")
+MAP_FIELDS = ("hits", "time_s", "start_s", "duration_s", "exposure_s", "n_passes")
 SIDE_NAMES = ("east", "west")
-_SCALAR_SCAN_KEYS = ("elevation_deg", "speed_deg_s", "block_hours", "fov_deg", "tube_spacing_deg")
+_SCALAR_SCAN_KEYS = ("elevation_deg", "speed_deg_s", "fov_deg", "tube_spacing_deg")
 _HEADER_KEYS = ("res_deg", "dt_s", "lat_deg", *_SCALAR_SCAN_KEYS)
 SCAN_DEFAULTS = {
     "elevation_deg": 40.0,
     "az_ranges": ((30.0, 150.0), (210.0, 330.0)),
     "speed_deg_s": 1.0,
-    "block_hours": 1.0,
     "fov_deg": 1.25,
     "tube_spacing_deg": 1.75,
 }
@@ -139,35 +139,32 @@ def scan_time_step(res_deg, speed_deg_s, az_ranges, dt_s=None, **_):
     return sweep_s / samples_per_sweep, samples_per_sweep
 
 
-def boresight_azel(t_s, *, elevation_deg, az_ranges, speed_deg_s, block_hours, **_):
-    """Return the boresight azimuth, elevation, and active scan side at the given times.
+def boresight_azel(t_s, side, *, elevation_deg, az_ranges, speed_deg_s, **_):
+    """Return the boresight azimuth and elevation while scanning one azimuth range.
 
     Parameters
     ----------
     t_s : numpy.ndarray
-        Time in seconds since the start of the schedule (LST = 0).
+        Time in seconds since the start of the scan (LST = 0).
+    side : int
+        Index of the scanned azimuth range (0 = east/rising, 1 = west/setting).
     elevation_deg : float
         Fixed boresight elevation in degrees.
     az_ranges : tuple
         ((east_min, east_max), (west_min, west_max)) azimuth ranges in degrees.
     speed_deg_s : float
         Azimuth scan speed in degrees per second.
-    block_hours : float
-        Length of each east/west scheduling block in hours.
 
     Returns
     -------
     az, el : numpy.ndarray
         Boresight azimuth and elevation in degrees.
-    side : numpy.ndarray
-        Index of the active scan range (0 = east, 1 = west).
     """
-    side = (t_s // (3600.0 * block_hours)).astype(int) % 2
-    low, high = np.asarray(az_ranges, dtype=float)[side].T
+    low, high = az_ranges[side]
     throw_s = (high - low) / speed_deg_s
     phase = t_s % (2.0 * throw_s)
     az = low + speed_deg_s * np.where(phase < throw_s, phase, 2.0 * throw_s - phase)
-    return az, np.full_like(az, elevation_deg), side
+    return az, np.full_like(az, elevation_deg)
 
 
 def horizon_to_equatorial(az_deg, el_deg, lst_deg, lat_deg=SO_LATITUDE_DEG):
@@ -220,6 +217,29 @@ def sky_to_pixel(shape, wcs, ra, dec):
     return np.where((y >= 0) & (y < ny), y * nx + x, -1)
 
 
+def transit_day(time_s, ra_deg):
+    """Return the index of the sidereal day in which the meridian transit nearest a crossing occurs.
+
+    The rising crossing of a patch precedes its transit and the setting crossing follows it, so
+    both crossings around one transit share an index; the daily rising/setting switch alternates
+    on this index.
+
+    Parameters
+    ----------
+    time_s : numpy.ndarray
+        Crossing times in seconds since a reference LST = 0.
+    ra_deg : numpy.ndarray
+        Right ascension of the patch in degrees.
+
+    Returns
+    -------
+    numpy.ndarray
+        Integer day index counted from the reference LST = 0.
+    """
+    ra_s = (np.asarray(ra_deg) % 360.0) / 360.0 * SIDEREAL_DAY_S
+    return np.floor((time_s - ra_s) / SIDEREAL_DAY_S + 0.5).astype(int)
+
+
 def simulate_time_maps(
     res_deg=0.5,
     *,
@@ -230,12 +250,13 @@ def simulate_time_maps(
     max_points=4_000_000,
     **scan_kwargs,
 ):
-    """Simulate one sidereal day of SO scanning and accumulate per-tube visit maps.
+    """Simulate one sidereal day of SO scanning in each azimuth range and accumulate visit maps.
 
     At every time sample, each map pixel whose center lies within a tube's circular field of view
     is hit, so all statistics are exact for the pixel-center position up to the sample interval.
-    A pixel is typically crossed once while rising (east range) and once while setting (west
-    range); only the crossing with more hits is kept for each tube.
+    Each range is scanned for a full sidereal day, so a pixel is crossed once while rising (east
+    range) and once while setting (west range); both crossings are kept and ``from_time_maps``
+    picks one per day.
 
     Parameters
     ----------
@@ -258,12 +279,13 @@ def simulate_time_maps(
     Returns
     -------
     dict
-        ``maps``: enmap of shape (len(MAP_FIELDS), ntube, ny, nx). Per tube and pixel it holds the
+        ``maps``: enmap of shape (len(MAP_FIELDS), ntube, 2, ny, nx), where the third axis is the
+        scan side (0 = east/rising, 1 = west/setting). Per tube, side and pixel it holds the
         number of in-FoV samples (``hits``), the circular mean time of the visit (``time_s``),
-        the scan side (``side``: 0 = east, 1 = west, -1 unobserved), the first in-FoV time
-        (``start_s``), the visit length from first to last in-FoV sample (``duration_s``), the
-        total time inside the FoV (``exposure_s``) and the number of azimuth sweeps that pass over
-        the pixel (``n_passes``). Times are seconds since LST = 0; unobserved pixels are NaN.
+        the first in-FoV time (``start_s``), the visit length from first to last in-FoV sample
+        (``duration_s``), the total time inside the FoV (``exposure_s``) and the number of azimuth
+        sweeps that pass over the pixel (``n_passes``). Times are seconds since LST = 0; unobserved
+        pixels are NaN.
         Also contains ``tubes``, ``res_deg``, ``dt_s``, ``lat_deg`` and the scan parameters.
     """
     _require_pixell()
@@ -290,10 +312,10 @@ def simulate_time_maps(
     n_samples = int(np.ceil(SIDEREAL_DAY_S / dt_s))
     n_sweeps = n_samples // per_sweep + 1
     chunk = max(1, max_points // (len(tubes) * len(dy) * per_sweep)) * per_sweep  # whole sweeps
-    for start in range(0, n_samples, chunk):
+    for side, start in ((s, i) for s in range(2) for i in range(0, n_samples, chunk)):
         k = np.arange(start, min(start + chunk, n_samples))
         t = k * dt_s
-        az, el, side = boresight_azel(t, **scan)
+        az, el = boresight_azel(t, side, **scan)
         tube_az, tube_el = tube_pointing(az, el, centers)
         ra_c, dec_c = horizon_to_equatorial(tube_az, tube_el, (360.0 * t / SIDEREAL_DAY_S)[:, None], lat_deg)
         center_pix = sky_to_pixel(shape, wcs, ra_c, dec_c).reshape(ra_c.shape)[..., None]
@@ -303,7 +325,7 @@ def simulate_time_maps(
         y = np.clip(y, 0, ny - 1)
         inside &= angular_separation_deg(ra_pix[x], dec_pix[y], ra_c[..., None], dec_c[..., None]) <= radius
         it, itube, _ = np.nonzero(inside)
-        bins = ((itube * 2 + side[it]) * ny + y[inside]) * nx + x[inside]
+        bins = ((itube * 2 + side) * ny + y[inside]) * nx + x[inside]
         tt = t[it]
         phase = 2.0 * np.pi * tt / SIDEREAL_DAY_S
         hits += np.bincount(bins, minlength=nbins)
@@ -319,12 +341,9 @@ def simulate_time_maps(
         sweeps = np.unique(bins.astype(np.int64) * n_sweeps + k[it] // per_sweep)
         passes += np.bincount(sweeps // n_sweeps, minlength=nbins)
 
-    # Keep the side (crossing) with more hits for each tube and pixel.
-    arrays = [a.reshape(len(tubes), 2, ny, nx) for a in (hits, cos_sum, sin_sum, passes)]
-    arrays += [a.reshape(len(tubes), 2, ny, nx) for a in (t_min, t_max, t_min_shift, t_max_shift)]
-    best = np.argmax(arrays[0], axis=1)[:, None]
     hits, cos_sum, sin_sum, passes, t_min, t_max, t_min_shift, t_max_shift = (
-        np.take_along_axis(a, best, axis=1)[:, 0] for a in arrays
+        a.reshape(len(tubes), 2, ny, nx)
+        for a in (hits, cos_sum, sin_sum, passes, t_min, t_max, t_min_shift, t_max_shift)
     )
     observed = hits > 0
     span, span_shift = t_max - t_min, t_max_shift - t_min_shift
@@ -336,7 +355,6 @@ def simulate_time_maps(
     fields = {
         "hits": hits,
         "time_s": nan_if_unobserved(mean_s),
-        "side": np.where(observed, best[:, 0], -1),
         "start_s": nan_if_unobserved(start_s),
         "duration_s": nan_if_unobserved(np.where(use_shift, span_shift, span) + dt_s),
         "exposure_s": hits * dt_s,
@@ -381,7 +399,7 @@ def equatorial_to_horizon(ra_deg, dec_deg, lst_deg, lat_deg=SO_LATITUDE_DEG):
 def point_visits(
     ra, dec, tube_id, *, res_deg=0.5, dt_s=None, lat_deg=SO_LATITUDE_DEG, max_gap_s=1800.0, **scan_kwargs
 ):
-    """Trace when one sky position is inside a tube's field of view over one sidereal day.
+    """Trace when one sky position is inside a tube's field of view over one day of each scan side.
 
     This is an independent, single-point reference for ``simulate_time_maps``: it converts the
     source into horizon coordinates and tests its separation from the tube center there. Pass a
@@ -405,39 +423,41 @@ def point_visits(
     Returns
     -------
     list of dict
-        One entry per visit with ``side``, ``time_s`` (circular mean), ``start_s``,
+        One entry per visit with ``side`` (scanned range), ``time_s`` (circular mean), ``start_s``,
         ``duration_s``, ``exposure_s`` and ``n_passes``; times in seconds since LST = 0.
     """
     scan = {key: scan_kwargs.get(key, value) for key, value in SCAN_DEFAULTS.items()}
     dt_s, per_sweep = scan_time_step(res_deg, dt_s=dt_s, **scan)
     k = np.arange(int(np.ceil(SIDEREAL_DAY_S / dt_s)))
     t = k * dt_s
-    az, el, side = boresight_azel(t, **scan)
-    tube_az, tube_el = tube_pointing(az, el, tube_offsets(scan["tube_spacing_deg"])[[tube_id]])
     src_az, src_el = equatorial_to_horizon(ra, dec, 360.0 * t / SIDEREAL_DAY_S, lat_deg)
-    inside = np.flatnonzero(
-        angular_separation_deg(tube_az[:, 0], tube_el[:, 0], src_az, src_el) <= 0.5 * scan["fov_deg"]
-    )
-    if len(inside) == 0:
-        return []
-    groups = np.split(inside, np.flatnonzero(np.diff(t[inside]) > max_gap_s) + 1)
-    unwrapped = [k[g].astype(float) for g in groups]
-    if len(groups) > 1 and t[groups[0][0]] < max_gap_s and t[groups[-1][-1]] > SIDEREAL_DAY_S - max_gap_s:
-        unwrapped[0] = np.concatenate((unwrapped.pop() - len(k), unwrapped[0]))
-        groups[0] = np.concatenate((groups.pop(), groups[0]))
     visits = []
-    for g, ku in zip(groups, unwrapped, strict=True):
-        times = ku * dt_s
-        visits.append(
-            {
-                "side": int(np.bincount(side[g]).argmax()),
-                "time_s": times.mean() % SIDEREAL_DAY_S,
-                "start_s": times[0] % SIDEREAL_DAY_S,
-                "duration_s": times[-1] - times[0] + dt_s,
-                "exposure_s": len(g) * dt_s,
-                "n_passes": len(np.unique(k[g] // per_sweep)),
-            }
+    for side in range(2):
+        az, el = boresight_azel(t, side, **scan)
+        tube_az, tube_el = tube_pointing(az, el, tube_offsets(scan["tube_spacing_deg"])[[tube_id]])
+        inside = np.flatnonzero(
+            angular_separation_deg(tube_az[:, 0], tube_el[:, 0], src_az, src_el) <= 0.5 * scan["fov_deg"]
         )
+        if len(inside) == 0:
+            continue
+        groups = np.split(inside, np.flatnonzero(np.diff(t[inside]) > max_gap_s) + 1)
+        unwrapped = [k[g].astype(float) for g in groups]
+        wraps = t[groups[0][0]] < max_gap_s and t[groups[-1][-1]] > SIDEREAL_DAY_S - max_gap_s
+        if len(groups) > 1 and wraps:
+            unwrapped[0] = np.concatenate((unwrapped.pop() - len(k), unwrapped[0]))
+            groups[0] = np.concatenate((groups.pop(), groups[0]))
+        for g, ku in zip(groups, unwrapped, strict=True):
+            times = ku * dt_s
+            visits.append(
+                {
+                    "side": side,
+                    "time_s": times.mean() % SIDEREAL_DAY_S,
+                    "start_s": times[0] % SIDEREAL_DAY_S,
+                    "duration_s": times[-1] - times[0] + dt_s,
+                    "exposure_s": len(g) * dt_s,
+                    "n_passes": len(np.unique(k[g] // per_sweep)),
+                }
+            )
     return visits
 
 
@@ -490,12 +510,14 @@ def read_time_maps(fname):
 class SimonsObservatoryObsTable(ObsTable):
     """An ObsTable of Simons Observatory map-pixel observations for one or more optics tubes.
 
-    Each row is one visit of one map pixel by one tube on one day. ``ra`` and ``dec`` are the pixel
-    center and ``time`` is the mean in-FoV time of the visit (MJD). ``time_start``/``time_end``
-    (MJD) and ``duration_s`` give the span from the first to the last in-FoV sample, ``exposure_s``
-    the total time inside the tube's field of view (s), ``n_passes`` the number of azimuth sweeps
-    over the pixel, and ``hits`` the number of in-FoV samples. Rows are normally created with
-    ``from_time_maps``.
+    Each row is one visit of one map pixel by one tube on one day; ``side`` says whether it was the
+    rising (east) or setting (west) crossing, which alternate with ``transit_day``. ``ra`` and
+    ``dec`` are the pixel center and ``time`` is the mean in-FoV time of the visit (MJD).
+    ``time_start``/``time_end`` (MJD) and ``duration_s`` give the span from the first to the last
+    in-FoV sample, ``exposure_s`` the total time inside the tube's field of view (s), ``n_passes``
+    the number of azimuth sweeps over the pixel, ``hits`` the number of in-FoV samples, and
+    ``transit_day`` the sidereal day (from the LST = 0 preceding the start) of the transit the
+    visit belongs to. Rows are normally created with ``from_time_maps``.
 
     Spatial queries map a position to its map pixel instead of using a cone search, so each source
     matches exactly the rows of the pixel that contains it.
@@ -526,8 +548,13 @@ class SimonsObservatoryObsTable(ObsTable):
         super().__init__(table, map_shape=tuple(map_shape[-2:]), map_wcs=map_wcs, **kwargs)
 
     @classmethod
-    def from_time_maps(cls, time_maps, start_date, n_days, *, tubes=None, filter_names=None, **kwargs):
+    def from_time_maps(
+        cls, time_maps, start_date, n_days, *, tubes=None, filter_names=None, first_side=0, **kwargs
+    ):
         """Materialize simulated time maps into an ObsTable over a date range.
+
+        Successive meridian transits of each pixel alternate between its rising (east) and its
+        setting (west) crossing, so each pixel is observed by each tube at most once per day.
 
         Parameters
         ----------
@@ -541,6 +568,9 @@ class SimonsObservatoryObsTable(ObsTable):
             Tubes to include. Defaults to all tubes in ``time_maps``.
         filter_names : sequence of str, optional
             Filter label for each of the 13 tubes. Defaults to ``SO_TUBE_FILTERS``.
+        first_side : int
+            Scan side (0 = east/rising, 1 = west/setting) for transits on the sidereal day (from
+            LST = 0) containing the start; the sides alternate on later days.
         **kwargs
             Additional survey values passed to the constructor.
 
@@ -558,16 +588,18 @@ class SimonsObservatoryObsTable(ObsTable):
         start_mjd = start.mjd
         lst_start = start.sidereal_time("mean", longitude=SO_LONGITUDE_DEG).deg
         lst0_mjd = start_mjd - lst_start / 360.0 * SIDEREAL_DAY_S / 86400.0
-        days = np.arange(int(np.ceil(n_days * 86400.0 / SIDEREAL_DAY_S)) + 2)
+        days = np.arange(-1, int(np.ceil(n_days * 86400.0 / SIDEREAL_DAY_S)) + 2)
+        ra_pix = np.degrees(np.asarray(maps.posmap())[1]).ravel()
 
         pieces = []
-        for tube in tubes:
-            fields = dict(
-                zip(MAP_FIELDS, maps[:, map_tubes.index(tube)].reshape(len(MAP_FIELDS), -1), strict=True)
-            )
+        for tube, side in ((tube, side) for tube in tubes for side in range(2)):
+            sub = maps[:, map_tubes.index(tube), side].reshape(len(MAP_FIELDS), -1)
+            fields = dict(zip(MAP_FIELDS, sub, strict=True))
             pixels = np.flatnonzero(fields["hits"] > 0)
-            mjd = lst0_mjd + (days[:, None] * SIDEREAL_DAY_S + fields["time_s"][pixels][None, :]) / 86400.0
-            keep = (mjd >= start_mjd) & (mjd < start_mjd + n_days)
+            time_s = days[:, None] * SIDEREAL_DAY_S + fields["time_s"][pixels][None, :]
+            day = transit_day(time_s, ra_pix[pixels])
+            mjd = lst0_mjd + time_s / 86400.0
+            keep = (mjd >= start_mjd) & (mjd < start_mjd + n_days) & ((day + first_side) % 2 == side)
             pix = np.broadcast_to(pixels, mjd.shape)[keep]
             # Start relative to the mean time, wrapped so visits spanning LST = 0 stay contiguous.
             start_offset_s = (
@@ -582,7 +614,8 @@ class SimonsObservatoryObsTable(ObsTable):
                         "time_end": time_start + fields["duration_s"][pix] / 86400.0,
                         "filter": pd.Categorical.from_codes(np.zeros(len(pix), int), [filter_names[tube]]),
                         "tube_id": np.full(len(pix), tube, dtype=np.int16),
-                        "side": pd.Categorical.from_codes(fields["side"][pix].astype(int), SIDE_NAMES),
+                        "side": pd.Categorical.from_codes(np.full(len(pix), side), SIDE_NAMES),
+                        "transit_day": day[keep].astype(np.int16),
                         **{
                             name: fields[name][pix].astype(np.float32)
                             for name in ("hits", "duration_s", "exposure_s", "n_passes")

@@ -44,7 +44,6 @@ FIELD_LABELS = {
     "duration_s": ("Visit duration, first to last in-FoV sample (min)", "viridis", 1.0 / 60.0),
     "exposure_s": ("Time in tube FoV per visit (s)", "magma", 1.0),
     "n_passes": ("Azimuth sweeps over pixel per visit", "cividis", 1.0),
-    "side": ("Scan side (0 = east, 1 = west)", "coolwarm", 1.0),
 }
 BAND_COLORS = {"MF": "tab:blue", "UHF": "tab:red", "LF": "tab:green"}
 
@@ -64,7 +63,9 @@ def parse_args():
     parser.add_argument("--tubes", type=int, nargs="+", default=list(range(13)), help="Tube indices.")
     parser.add_argument("--days", type=float, default=7.0, help="Survey length in days for the ObsTable.")
     parser.add_argument("--start", default="2026-10-14", help="Survey start date (UTC).")
-    parser.add_argument("--block-hours", type=float, default=1.0, help="East/west schedule block length.")
+    parser.add_argument(
+        "--first-side", type=int, default=0, help="Side of the first day (0 rising, 1 setting)."
+    )
     parser.add_argument("--outdir", type=Path, default=Path("analysis/so_report"), help="Report directory.")
     parser.add_argument("--overwrite", action="store_true", help="Re-simulate even if cached maps exist.")
     parser.add_argument("--debug", action="store_true", help="Quick run: 2 deg pixels, tubes 0 1 12, 3 days.")
@@ -87,13 +88,13 @@ def load_or_simulate(args):
     dict
         Time maps as returned by ``simulate_time_maps``.
     """
-    tag = f"res{args.res:g}_block{args.block_hours:g}_tubes{'-'.join(map(str, args.tubes))}"
+    tag = f"res{args.res:g}_sides_tubes{'-'.join(map(str, args.tubes))}"
     fname = args.outdir / f"time_maps_{tag}.fits"
     if fname.exists() and not args.overwrite:
         print(f"Reading cached time maps from {fname}")
         return read_time_maps(fname)
     print(f"Simulating one sidereal day for tubes {args.tubes} at {args.res} deg...", flush=True)
-    time_maps = simulate_time_maps(args.res, tubes=args.tubes, block_hours=args.block_hours)
+    time_maps = simulate_time_maps(args.res, tubes=args.tubes)
     write_time_maps(fname, time_maps)
     return time_maps
 
@@ -129,8 +130,8 @@ def sky_imshow(ax, image, maps, **kwargs):
     return artist
 
 
-def plot_tube_grid(time_maps, field, fname):
-    """Plot one map field for every simulated tube in a grid.
+def plot_tube_grid(time_maps, field, side, fname):
+    """Plot one map field of one scan side for every simulated tube in a grid.
 
     Parameters
     ----------
@@ -138,10 +139,12 @@ def plot_tube_grid(time_maps, field, fname):
         Output of ``simulate_time_maps``.
     field : str
         One of ``FIELD_LABELS``.
+    side : int
+        Scan side (0 = east/rising, 1 = west/setting).
     fname : Path
         Output image filename.
     """
-    maps, tubes = time_maps["maps"], time_maps["tubes"]
+    maps, tubes = time_maps["maps"][:, :, side], time_maps["tubes"]
     label, cmap, scale = FIELD_LABELS[field]
     data = np.where(maps[0] > 0, maps[MAP_FIELDS.index(field)] * scale, np.nan)
     ncol = min(len(tubes), 3)
@@ -159,7 +162,7 @@ def plot_tube_grid(time_maps, field, fname):
 
 
 def plot_coverage(time_maps, fname):
-    """Plot the number of tubes observing each pixel in one sidereal day.
+    """Plot the number of tubes observing each pixel on a rising day and on a setting day.
 
     Parameters
     ----------
@@ -170,10 +173,13 @@ def plot_coverage(time_maps, fname):
     """
     maps = time_maps["maps"]
     count = (maps[0] > 0).sum(axis=0).astype(float)
-    fig, ax = plt.subplots(figsize=(10, 3.6))
-    artist = sky_imshow(ax, np.where(count > 0, count, np.nan), maps, cmap="viridis")
-    fig.colorbar(artist, ax=ax, label="Tubes observing pixel per day")
-    ax.set_title(f"Coverage union of {len(time_maps['tubes'])} tubes")
+    fig, axes = plt.subplots(2, 1, figsize=(10, 7))
+    for ax, side, name in zip(axes, range(2), ("rising (east)", "setting (west)"), strict=True):
+        artist = sky_imshow(
+            ax, np.where(count[side] > 0, count[side], np.nan), maps, cmap="viridis", vmin=1, vmax=count.max()
+        )
+        ax.set_title(f"{name} day: coverage union of {len(time_maps['tubes'])} tubes")
+    fig.colorbar(artist, ax=axes, label="Tubes observing pixel per day")
     fig.savefig(fname, dpi=110, bbox_inches="tight")
     plt.close(fig)
 
@@ -218,12 +224,11 @@ def plot_table_checks(table, start_mjd, fname):
         Output image filename.
     """
     df = table._table
-    day = np.floor((df["time"] - start_mjd) * 86400.0 / SIDEREAL_DAY_S).astype(int)
-    per_day = df.groupby([df["tube_id"], df["pixel_index"], day]).size()
+    per_day = df.groupby(["tube_id", "pixel_index", "transit_day"]).size()
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 3.8))
     ax1.hist(per_day.to_numpy(), bins=np.arange(0.5, 4.5), rwidth=0.8)
-    ax1.set_xlabel("Observations per (tube, pixel, sidereal day)")
+    ax1.set_xlabel("Observations per (tube, pixel, transit day)")
     ax1.set_ylabel("Count")
     ax1.set_yscale("log")
     ax1.set_title("Each point is hit once per day")
@@ -245,6 +250,112 @@ def plot_table_checks(table, start_mjd, fname):
     fig.tight_layout()
     fig.savefig(fname, dpi=110, bbox_inches="tight")
     plt.close(fig)
+
+
+def band_side_coverage(time_maps, bands):
+    """Return which pixels each band observes on each scan side, combining the band's tubes.
+
+    Parameters
+    ----------
+    time_maps : dict
+        Output of ``simulate_time_maps``.
+    bands : list of str
+        Band names; "all" combines every simulated tube.
+
+    Returns
+    -------
+    dict
+        Band -> boolean array (2, ny, nx) of pixels hit on the rising and setting crossing.
+    """
+    hit = time_maps["maps"][MAP_FIELDS.index("hits")] > 0
+    filters = np.array([SO_TUBE_FILTERS[tube] for tube in time_maps["tubes"]])
+    return {band: hit[(filters == band) | (band == "all")].any(axis=0) for band in bands}
+
+
+def plot_sky_stats(time_maps, table, start_mjd, n_days, fname):
+    """Plot the daily sky fraction observed and the distribution of days per year a pixel is observed.
+
+    Daily coverage is measured from the ObsTable over whole UTC days. Days per year follow from the
+    time maps: on alternate transit days a pixel is observed if the band hits it on that crossing,
+    so it is observed on ``N * (rising + setting) / 2`` of the ``N`` transits in a year.
+
+    Parameters
+    ----------
+    time_maps : dict
+        Output of ``simulate_time_maps``.
+    table : SimonsObservatoryObsTable
+        The materialized observation table.
+    start_mjd : float
+        Survey start (MJD).
+    n_days : float
+        Survey length in days.
+    fname : Path
+        Output image filename.
+
+    Returns
+    -------
+    dict
+        Per band: daily sky fractions, ever-observed fraction and area-weighted days-per-year percentiles.
+    """
+    maps = time_maps["maps"]
+    area = np.asarray(maps.pixsizemap(broadcastable=False)) / (4.0 * np.pi)  # Fraction of the full sky.
+    bands = [*sorted(table.filters), "all"]
+    colors = {**BAND_COLORS, "all": "k"}
+    df = table._table
+    day = np.floor(df["time"].to_numpy() - start_mjd).astype(int)
+    n_full = int(np.floor(n_days))
+    transits_per_year = 365.25 * 86400.0 / SIDEREAL_DAY_S
+    coverage = band_side_coverage(time_maps, bands)
+
+    fig, axes = plt.subplots(1, 3, figsize=(17, 3.8), gridspec_kw={"width_ratios": [1, 1, 1.6]})
+    stats = {}
+    for offset, band in enumerate(bands):
+        rows = (df["filter"] == band).to_numpy() | (band == "all")
+        daily = [
+            area.ravel()[np.unique(df["pixel_index"].to_numpy()[rows & (day == d)])].sum()
+            for d in range(n_full)
+        ]
+        width = 0.8 / len(bands)
+        axes[0].bar(
+            np.arange(n_full) + (offset - (len(bands) - 1) / 2) * width,
+            daily,
+            width,
+            color=colors[band],
+            label=band,
+        )
+        per_year = transits_per_year * coverage[band].mean(axis=0)
+        seen = per_year > 0
+        axes[1].hist(
+            per_year[seen],
+            bins=np.linspace(0, 370, 38),
+            weights=area[seen],
+            histtype="step",
+            lw=1.5,
+            color=colors[band],
+            label=band,
+        )
+        order = np.argsort(per_year[seen])
+        cdf = np.cumsum(area[seen][order]) / area[seen].sum()
+        quantiles = per_year[seen][order][np.searchsorted(cdf, [0.1, 0.5, 0.9])]
+        stats[band] = {
+            "daily": daily,
+            "ever": area[seen].sum(),
+            "per_year": quantiles,
+            "full": area[per_year > 0.99 * transits_per_year].sum() / area[seen].sum(),
+        }
+    axes[0].set_xlabel("UTC day since start")
+    axes[0].set_ylabel("Fraction of full sky observed")
+    axes[0].legend(fontsize=8)
+    axes[1].set_xlabel("Days per year a pixel is observed")
+    axes[1].set_ylabel("Sky fraction")
+    axes[1].legend(fontsize=8)
+    image = transits_per_year * coverage["all"].mean(axis=0)
+    artist = sky_imshow(axes[2], np.where(image > 0, image, np.nan), maps, cmap="viridis", vmin=0)
+    fig.colorbar(artist, ax=axes[2], label="Days per year observed (any band)")
+    fig.tight_layout()
+    fig.savefig(fname, dpi=110, bbox_inches="tight")
+    plt.close(fig)
+    return stats
 
 
 def random_sources(n, rng, dec_range=(-60.0, 20.0)):
@@ -376,17 +487,16 @@ def plot_validation(time_maps, fname, n_sources=200):
         Median and 90th-percentile absolute errors for the report summary.
     """
     maps, tube = time_maps["maps"], time_maps["tubes"][0]
-    fields = dict(zip(MAP_FIELDS, maps[:, 0].reshape(len(MAP_FIELDS), -1), strict=True))
+    fields = dict(zip(MAP_FIELDS, maps[:, 0].reshape(len(MAP_FIELDS), 2, -1), strict=True))
     ra, dec = random_sources(n_sources, np.random.default_rng(1))
     pixels = sky_to_pixel(maps.shape, maps.wcs, ra, dec)
     pairs = []
     for r, d, pix in zip(ra, dec, pixels, strict=True):
-        visits = [v for v in point_visits(r, d, tube, **time_maps) if v["side"] == fields["side"][pix]]
-        if pix >= 0 and fields["hits"][pix] > 0 and visits:
-            truth = max(visits, key=lambda v: v["exposure_s"])
-            pairs.append(
-                [(fields[k][pix], truth[k]) for k in ("duration_s", "exposure_s", "n_passes", "time_s")]
-            )
+        for visit in point_visits(r, d, tube, **time_maps) if pix >= 0 else []:
+            side = visit["side"]
+            if fields["hits"][side, pix] > 0:
+                keys = ("duration_s", "exposure_s", "n_passes", "time_s")
+                pairs.append([(fields[k][side, pix], visit[k]) for k in keys])
     pairs = np.array(pairs)
     time_err = (
         pairs[:, 3, 0] - pairs[:, 3, 1] + 0.5 * SIDEREAL_DAY_S
@@ -450,10 +560,13 @@ sidereal day of the idealized scan, accumulate per-pixel hit and mean-time maps 
 <ul>
 <li>Site 22&deg;57'31"S 67&deg;47'15"W; boresight elevation 40&deg;; azimuth triangle wave at 1&deg;/s with
 instantaneous turnarounds.</li>
-<li>Schedule alternates east (az 30&ndash;150&deg;) and west (az 210&ndash;330&deg;) blocks, phased in LST,
-so the pattern repeats every sidereal day. <b>The real SO block schedule is still to be decided.</b></li>
-<li>Each pixel is observed at most once per tube per day: if crossed in both ranges, only the crossing with
-more hits is kept. Row time is the hit-weighted (circular) mean of that crossing.</li>
+<li>Each patch is crossed once while rising, in the east range (az 30&ndash;150&deg;), and once while
+setting, in the west range (az 210&ndash;330&deg;). SO switches daily between the two for each patch:
+the rising and setting crossings around one meridian transit share a <code>transit_day</code>, and
+successive transit days use opposite crossings. Each range is simulated for a full sidereal day and
+<code>from_time_maps</code> picks one crossing per day.</li>
+<li>Each pixel is therefore observed at most once per tube per day. Row time is the hit-weighted (circular)
+mean of that crossing.</li>
 <li>13 tubes, 1.25&deg; field of view, 1.75&deg; hex spacing with half the outer ring missing; generic
 filter labels (8 MF, 4 UHF, 1 LF) to be replaced by the real mapping.</li>
 <li>No refraction, precession, sun/moon avoidance, weather, or turnaround overhead.</li>
@@ -472,7 +585,9 @@ def main():
     args.outdir.mkdir(parents=True, exist_ok=True)
     time_maps = load_or_simulate(args)
     start_mjd = Time(args.start, scale="utc").mjd
-    table = SimonsObservatoryObsTable.from_time_maps(time_maps, args.start, args.days)
+    table = SimonsObservatoryObsTable.from_time_maps(
+        time_maps, args.start, args.days, first_side=args.first_side
+    )
     print(f"Built ObsTable with {len(table):,} rows")
 
     prefix = "debug_" if args.debug else ""
@@ -488,9 +603,11 @@ def main():
     cadence = add(
         "cadence",
         "Cadence and visit length (per band)",
-        "Revisit intervals cluster at one sidereal day (23.93 h); sources seen on both the rising and setting"
-        " crossings (by different tubes) also get shorter intervals. A visit is a train of short passes"
-        " (one per 2-minute azimuth sweep) over its span.",
+        "Each source's successive transits alternate between its rising and setting crossing, so revisit"
+        " intervals alternate between one sidereal day plus and minus the source's rising-to-setting offset"
+        " (which depends on declination), giving two peaks symmetric about 24 h. Edge pixels seen on only one"
+        " crossing are revisited every two days. A visit is a train of short passes (one per 2-minute"
+        " azimuth sweep) over its span.",
         plot_cadence,
         table,
         args.days,
@@ -509,22 +626,39 @@ def main():
         ("exposure_s", "Exposure"),
         ("n_passes", "Passes"),
     ):
-        add(field, f"{title} maps", FIELD_LABELS[field][0] + ".", plot_tube_grid, time_maps, field)
-    add(
-        "time_s",
-        "Observation-time maps",
-        "Mean LST of each pixel's daily visit.",
-        plot_tube_grid,
+        caption = FIELD_LABELS[field][0] + ", rising crossing (setting is the mirror image)."
+        add(field, f"{title} maps", caption, plot_tube_grid, time_maps, field, 0)
+    for side, name in enumerate(SIDE_NAMES):
+        crossing = ("rising", "setting")[side]
+        caption = f"Mean LST of each pixel's visit on {crossing} days ({name} azimuth range)."
+        add(
+            f"time_s_{name}",
+            f"Observation-time maps: {crossing}",
+            caption,
+            plot_tube_grid,
+            time_maps,
+            "time_s",
+            side,
+        )
+    sky = add(
+        "sky_stats",
+        "Sky coverage and days observed per year",
+        "Left: fraction of the full sky observed on each UTC day (any tube of the band); it alternates"
+        " because the alternating crossing shifts each pixel by its rising-to-setting offset."
+        " Middle: area-weighted distribution of days per year a pixel is observed (one transit per"
+        " sidereal day, alternating rising/setting). Right: the same for any band. Pixels seen on only"
+        " one crossing are observed every other day. The idealized model has no weather, sun/moon"
+        " avoidance or downtime, so these are upper limits.",
+        plot_sky_stats,
         time_maps,
-        "time_s",
-    )
-    add(
-        "side", "Scan side", "Azimuth range of each visit (east = rising).", plot_tube_grid, time_maps, "side"
+        table,
+        start_mjd,
+        args.days,
     )
     add(
         "coverage",
         "Coverage union",
-        "Number of tubes that observe each pixel in a day.",
+        "Number of tubes that observe each pixel on a rising day and on a setting day.",
         plot_coverage,
         time_maps,
     )
@@ -548,23 +682,32 @@ def main():
 
     fields = dict(zip(MAP_FIELDS, time_maps["maps"], strict=True))
     observed = fields["hits"] > 0
-    dec = np.degrees(time_maps["maps"].posmap()[0])
+    dec = np.degrees(time_maps["maps"].posmap()[0])[observed.any((0, 1))]
     summary = {
         "Mode": "debug" if args.debug else "full",
         "Resolution (deg) / sample interval (s)": f"{time_maps['res_deg']} / {time_maps['dt_s']:.3f}",
-        "Block length (h)": time_maps["block_hours"],
+        "First day scan side": SIDE_NAMES[args.first_side],
         "Tubes": ", ".join(map(str, time_maps["tubes"])),
         "Start / days": f"{args.start} / {args.days:g}",
         "ObsTable rows": f"{len(table):,}",
-        "Observed Dec range (deg)": f"{dec[observed.any(0)].min():.1f} to {dec[observed.any(0)].max():.1f}",
+        "Observed Dec range (deg)": f"{dec.min():.1f} to {dec.max():.1f}",
         "Per tube visit: median duration (min) / exposure (s) / passes": " / ".join(
             f"{np.median(fields[key][observed]) * scale:.1f}"
             for key, scale in (("duration_s", 1 / 60), ("exposure_s", 1), ("n_passes", 1))
         ),
-        "East / west fraction": "/".join(
-            f"{np.mean(fields['side'][observed] == i):.2f}" for i in range(len(SIDE_NAMES))
+        "Fraction of observed (tube, pixel) seen on both crossings": (
+            f"{np.mean(observed.all(1)[observed.any(1)]):.3f}"
         ),
     }
+    for band, values in sky.items():
+        p10, p50, p90 = values["per_year"]
+        summary[f"{band}: daily sky fraction mean (min-max) / ever observed"] = (
+            f"{np.mean(values['daily']):.3f} ({min(values['daily']):.3f}-{max(values['daily']):.3f})"
+            f" / {values['ever']:.3f}"
+        )
+        summary[f"{band}: days per year observed, 10/50/90% of area / fraction every day"] = (
+            f"{p10:.0f} / {p50:.0f} / {p90:.0f} / {values['full']:.3f}"
+        )
     for band, values in cadence.items():
         summary[f"{band}: median revisit (h) / visits per day / span (min) / exposure (s)"] = " / ".join(
             f"{values[key]:.2f}" for key in ("gaps", "per_day", "span", "exposure")
