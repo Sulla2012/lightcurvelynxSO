@@ -653,8 +653,8 @@ def simulate_downtime(
     n_days,
     *,
     uptime=0.65,
-    chunk_fraction=0.6,
-    chunk_days=(5.0, 9.0),
+    chunk_fraction=0.75,
+    chunk_days=(3.0, 14.0),
     chunk_months=(6, 7, 8, 9),
     chunk_season_weight=3.0,
     gap_hours=(1.0, 6.0),
@@ -663,7 +663,7 @@ def simulate_downtime(
 ):
     """Draw random instrument downtime intervals.
 
-    Downtime has two parts: long outages of about a week, preferentially in the austral winter
+    Downtime has two parts: long outages of days to weeks, preferentially in the austral winter
     (June-September), and scattered interruptions of a few hours that start during local daytime.
     Outages are added until they cover ``chunk_fraction`` of the downtime budget, then
     interruptions until the total downtime reaches ``(1 - uptime) * n_days``.

@@ -690,8 +690,8 @@ mean of that crossing.</li>
 <li>Pointings are precessed (IAU 2006) from the mean equator and equinox of one epoch, mid-way through
 the year, to ICRS; over a multi-year survey this drifts by ~0.014&deg; per year. Refraction (~0.01&deg;
 at 40&deg; elevation), nutation and aberration (&lt;0.006&deg;) are ignored.</li>
-<li>Downtime: 65% uptime by default, of which 60% of the lost time is in ~week-long outages
-(5&ndash;9 days, three times more likely to start in June&ndash;September) and the rest in 1&ndash;6&nbsp;h
+<li>Downtime: 65% uptime by default, of which 75% of the lost time is in long outages
+(3&ndash;14 days, three times more likely to start in June&ndash;September) and the rest in 1&ndash;6&nbsp;h
 interruptions starting between 08:00 and 20:00 local time. Visits overlapping downtime are dropped. The
 7-day ObsTable diagnostics above the yearly plots use no downtime. No sun/moon avoidance.</li>
 <li>The az 30&ndash;150&deg; / 210&ndash;330&deg; throws limit coverage to roughly Dec &minus;59&deg; to
@@ -768,8 +768,8 @@ def main():
     add(
         "downtime",
         "Downtime realization",
-        f"One random year of downtime for {args.uptime:.0%} uptime: about week-long outages, preferentially"
-        " June&ndash;September, plus interruptions of a few hours starting during local daytime.",
+        f"One random year of downtime for {args.uptime:.0%} uptime: outages of 3&ndash;14 days,"
+        " preferentially June&ndash;September, plus few-hour interruptions starting in local daytime.",
         plot_downtime,
         downtime,
         args.start,

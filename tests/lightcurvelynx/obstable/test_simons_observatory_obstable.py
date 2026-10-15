@@ -266,7 +266,7 @@ def test_simulate_downtime():
     assert 1.0 - lengths.sum() / 365.25 == pytest.approx(0.65, abs=1e-6)
     assert np.all(downtime[1:, 0] > downtime[:-1, 1])
     long = lengths > 2.0
-    assert lengths[long].sum() / 365.25 == pytest.approx(0.35 * 0.6, abs=0.05)
+    assert lengths[long].sum() / 365.25 == pytest.approx(0.35 * 0.75, abs=0.05)
     winter = np.isin(Time(downtime[long, 0], format="mjd").ymdhms.month, (6, 7, 8, 9))
     assert winter.mean() > 4 / 12
     local_hour = ((downtime[~long, 0] + SO_LONGITUDE_DEG / 360.0) % 1.0) * 24.0
