@@ -25,21 +25,28 @@ import numpy as np  # noqa: E402
 from astropy.time import Time  # noqa: E402
 
 from lightcurvelynx.obstable.simons_observatory_obstable import (  # noqa: E402
+    MAP_FIELDS,
     SIDE_NAMES,
     SIDEREAL_DAY_S,
     SO_TUBE_FILTERS,
     SimonsObservatoryObsTable,
+    point_visits,
     read_time_maps,
     simulate_time_maps,
+    sky_to_pixel,
     tube_offsets,
     write_time_maps,
 )
 
+# Field -> (colorbar label, colormap, scale factor applied before plotting).
 FIELD_LABELS = {
-    "time_s": ("LST of observation (h)", "twilight"),
-    "exposure_s": ("Time in tube FoV per day (s)", "magma"),
-    "side": ("Scan side (0 = east, 1 = west)", "coolwarm"),
+    "time_s": ("LST of observation (h)", "twilight", 24.0 / SIDEREAL_DAY_S),
+    "duration_s": ("Visit duration, first to last in-FoV sample (min)", "viridis", 1.0 / 60.0),
+    "exposure_s": ("Time in tube FoV per visit (s)", "magma", 1.0),
+    "n_passes": ("Azimuth sweeps over pixel per visit", "cividis", 1.0),
+    "side": ("Scan side (0 = east, 1 = west)", "coolwarm", 1.0),
 }
+BAND_COLORS = {"MF": "tab:blue", "UHF": "tab:red", "LF": "tab:green"}
 
 
 def parse_args():
@@ -135,11 +142,8 @@ def plot_tube_grid(time_maps, field, fname):
         Output image filename.
     """
     maps, tubes = time_maps["maps"], time_maps["tubes"]
-    index = ("hits", "time_s", "side", "exposure_s").index(field)
-    data = np.where(maps[0] > 0, maps[index], np.nan)
-    if field == "time_s":
-        data = data / SIDEREAL_DAY_S * 24.0
-    label, cmap = FIELD_LABELS[field]
+    label, cmap, scale = FIELD_LABELS[field]
+    data = np.where(maps[0] > 0, maps[MAP_FIELDS.index(field)] * scale, np.nan)
     ncol = min(len(tubes), 3)
     nrow = int(np.ceil(len(tubes) / ncol))
     fig, axes = plt.subplots(nrow, ncol, figsize=(5.5 * ncol, 2.4 * nrow + 0.6), squeeze=False)
@@ -185,12 +189,11 @@ def plot_layout(time_maps, fname):
         Output image filename.
     """
     offsets = tube_offsets(time_maps["tube_spacing_deg"])
-    colors = {"MF": "tab:blue", "UHF": "tab:red", "LF": "tab:green"}
     fig, ax = plt.subplots(figsize=(4.5, 4.5))
     for tube, (x, y) in enumerate(offsets):
         filt = SO_TUBE_FILTERS[tube]
         alpha = 0.6 if tube in time_maps["tubes"] else 0.15
-        ax.add_patch(plt.Circle((x, y), time_maps["fov_deg"] / 2, color=colors[filt], alpha=alpha))
+        ax.add_patch(plt.Circle((x, y), time_maps["fov_deg"] / 2, color=BAND_COLORS[filt], alpha=alpha))
         ax.text(x, y, f"{tube}\n{filt}", ha="center", va="center", fontsize=8)
     ax.set_xlim(-4.5, 4.5)
     ax.set_ylim(-4.5, 4.5)
@@ -242,6 +245,174 @@ def plot_table_checks(table, start_mjd, fname):
     fig.tight_layout()
     fig.savefig(fname, dpi=110, bbox_inches="tight")
     plt.close(fig)
+
+
+def random_sources(n, rng, dec_range=(-60.0, 20.0)):
+    """Draw sky positions uniformly on the sphere within a declination band.
+
+    Parameters
+    ----------
+    n : int
+        Number of positions.
+    rng : numpy.random.Generator
+        Random number generator.
+    dec_range : tuple
+        (min, max) declination in degrees.
+
+    Returns
+    -------
+    ra, dec : numpy.ndarray
+        Positions in degrees.
+    """
+    sin_dec = rng.uniform(*np.sin(np.radians(dec_range)), n)
+    return rng.uniform(0.0, 360.0, n), np.degrees(np.arcsin(sin_dec))
+
+
+def telescope_visits(rows, merge_gap_days=1.0 / 24.0):
+    """Merge per-tube rows of one band into telescope visits (tube visits within the gap).
+
+    Parameters
+    ----------
+    rows : pandas.DataFrame
+        ObsTable rows for one source and band, sorted by time.
+    merge_gap_days : float
+        Tube visits whose mean times differ by less than this are one telescope visit.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per visit with mean ``time`` (MJD), ``span_s`` (first start to last end) and
+        summed tube ``exposure_s``.
+    """
+    times = rows["time"].to_numpy()
+    group = np.cumsum(np.diff(times, prepend=-np.inf) > merge_gap_days)
+    merged = rows.groupby(group).agg(
+        time=("time", "mean"),
+        start=("time_start", "min"),
+        end=("time_end", "max"),
+        exposure_s=("exposure_s", "sum"),
+    )
+    merged["span_s"] = (merged["end"] - merged["start"]) * 86400.0
+    return merged
+
+
+def plot_cadence(table, n_days, fname, n_sources=1000):
+    """Plot per-band revisit intervals, visits per day, visit spans and exposure for random sources.
+
+    Parameters
+    ----------
+    table : SimonsObservatoryObsTable
+        The materialized observation table.
+    n_days : float
+        Survey length in days.
+    fname : Path
+        Output image filename.
+    n_sources : int
+        Number of random source positions.
+
+    Returns
+    -------
+    dict
+        Median statistics per band for the report summary.
+    """
+    df = table._table
+    ra, dec = random_sources(n_sources, np.random.default_rng(0))
+    stats = {band: {"gaps": [], "per_day": [], "span": [], "exposure": []} for band in table.filters}
+    for inds in table.range_search(ra, dec):
+        rows = df.iloc[inds]
+        for band in table.filters:
+            visits = telescope_visits(rows[rows["filter"] == band])
+            stats[band]["per_day"].append(len(visits) / n_days)
+            stats[band]["gaps"].extend(np.diff(visits["time"]) * 24.0)
+            stats[band]["span"].extend(visits["span_s"] / 60.0)
+            stats[band]["exposure"].extend(visits["exposure_s"])
+
+    panels = [
+        ("gaps", "Revisit interval (h)", np.arange(0, 49, 0.5)),
+        ("per_day", "Telescope visits per day", np.arange(-0.125, 2.4, 0.25)),
+        ("span", "Visit span over all band tubes (min)", np.arange(0, 41, 1)),
+        ("exposure", "Exposure per visit, summed over band tubes (s)", 40),
+    ]
+    fig, axes = plt.subplots(1, 4, figsize=(17, 3.6))
+    for ax, (key, label, bins) in zip(axes, panels, strict=True):
+        for band, values in stats.items():
+            ax.hist(
+                values[key],
+                bins=bins,
+                histtype="step",
+                lw=1.5,
+                color=BAND_COLORS.get(band),
+                label=band,
+                density=True,
+            )
+        ax.set_xlabel(label)
+    axes[0].set_ylabel("Density")
+    axes[0].legend()
+    fig.suptitle(f"Cadence for {n_sources} random sources (Dec -60 to +20), tube visits merged within 1 h")
+    fig.tight_layout()
+    fig.savefig(fname, dpi=110, bbox_inches="tight")
+    plt.close(fig)
+    return {
+        band: {key: float(np.median(values[key])) if len(values[key]) else np.nan for key in values}
+        for band, values in stats.items()
+    }
+
+
+def plot_validation(time_maps, fname, n_sources=200):
+    """Compare map-pixel visit statistics with the exact single-point trace at random positions.
+
+    Parameters
+    ----------
+    time_maps : dict
+        Output of ``simulate_time_maps``.
+    fname : Path
+        Output image filename.
+    n_sources : int
+        Number of random source positions (traced with the first simulated tube).
+
+    Returns
+    -------
+    dict
+        Median and 90th-percentile absolute errors for the report summary.
+    """
+    maps, tube = time_maps["maps"], time_maps["tubes"][0]
+    fields = dict(zip(MAP_FIELDS, maps[:, 0].reshape(len(MAP_FIELDS), -1), strict=True))
+    ra, dec = random_sources(n_sources, np.random.default_rng(1))
+    pixels = sky_to_pixel(maps.shape, maps.wcs, ra, dec)
+    pairs = []
+    for r, d, pix in zip(ra, dec, pixels, strict=True):
+        visits = [v for v in point_visits(r, d, tube, **time_maps) if v["side"] == fields["side"][pix]]
+        if pix >= 0 and fields["hits"][pix] > 0 and visits:
+            truth = max(visits, key=lambda v: v["exposure_s"])
+            pairs.append(
+                [(fields[k][pix], truth[k]) for k in ("duration_s", "exposure_s", "n_passes", "time_s")]
+            )
+    pairs = np.array(pairs)
+    time_err = (
+        pairs[:, 3, 0] - pairs[:, 3, 1] + 0.5 * SIDEREAL_DAY_S
+    ) % SIDEREAL_DAY_S - 0.5 * SIDEREAL_DAY_S
+
+    fig, axes = plt.subplots(1, 4, figsize=(17, 3.8))
+    for ax, i, label in zip(axes, range(3), ("Duration (s)", "Exposure (s)", "Passes"), strict=False):
+        ax.scatter(pairs[:, i, 1], pairs[:, i, 0], s=8, alpha=0.6)
+        lim = [0, pairs[:, i].max() * 1.05]
+        ax.plot(lim, lim, "k--", lw=0.8)
+        ax.set_xlabel(f"{label}: exact point trace")
+        ax.set_ylabel(f"{label}: map pixel")
+    axes[3].hist(time_err, bins=40)
+    axes[3].set_xlabel("Mean visit time error, pixel - point (s)")
+    fig.suptitle(
+        f"Pixelization error at {time_maps['res_deg']} deg for {len(pairs)} random sources (tube {tube})"
+    )
+    fig.tight_layout()
+    fig.savefig(fname, dpi=110, bbox_inches="tight")
+    plt.close(fig)
+    errors = {
+        "duration (s)": pairs[:, 0, 0] - pairs[:, 0, 1],
+        "exposure (s)": pairs[:, 1, 0] - pairs[:, 1, 1],
+    }
+    errors.update({"passes": pairs[:, 2, 0] - pairs[:, 2, 1], "mean time (s)": time_err})
+    return {key: np.percentile(np.abs(v), [50, 90]) for key, v in errors.items()}
 
 
 def write_report(outdir, figures, summary):
@@ -305,52 +476,101 @@ def main():
     print(f"Built ObsTable with {len(table):,} rows")
 
     prefix = "debug_" if args.debug else ""
-    figures = [
-        ("layout", "Tube layout", "Hex focal plane; circles are 1.25&deg; fields of view.", plot_layout),
-        ("time", "Observation-time maps", "Mean LST of each pixel's single daily crossing.", None),
-        (
-            "side",
-            "Scan side",
-            "Which azimuth range observed each pixel (east = rising, west = setting).",
-            None,
-        ),
-        ("exposure", "Exposure maps", "Seconds per day that each pixel spends inside the tube FoV.", None),
-        ("coverage", "Coverage union", "Number of tubes that observe each pixel in a day.", plot_coverage),
-    ]
-    fields = {"time": "time_s", "side": "side", "exposure": "exposure_s"}
     entries = []
-    for key, title, caption, func in figures:
+
+    def add(key, title, caption, plot, *plot_args):
+        """Make one figure and register it for the report."""
         name = f"{prefix}{key}.png"
-        if func is None:
-            plot_tube_grid(time_maps, fields[key], args.outdir / name)
-        else:
-            func(time_maps, args.outdir / name)
+        result = plot(*plot_args, args.outdir / name)
         entries.append((name, title, caption))
-    name = f"{prefix}table_checks.png"
-    plot_table_checks(table, start_mjd, args.outdir / name)
-    entries.append(
-        (name, "ObsTable checks", "Left: every (tube, pixel, day) has exactly one row. Right: cadence.")
+        return result
+
+    cadence = add(
+        "cadence",
+        "Cadence and visit length (per band)",
+        "Revisit intervals cluster at one sidereal day (23.93 h); sources seen on both the rising and setting"
+        " crossings (by different tubes) also get shorter intervals. A visit is a train of short passes"
+        " (one per 2-minute azimuth sweep) over its span.",
+        plot_cadence,
+        table,
+        args.days,
+    )
+    errors = add(
+        "validation",
+        "Validation against an exact single-point trace",
+        "Map statistics are exact at pixel centers; the scatter here is pixelization error for arbitrary"
+        " source positions. Duration is quantized by the sweep period, so off-by-one-pass errors move it by"
+        " ~2 minutes.",
+        plot_validation,
+        time_maps,
+    )
+    for field, title in (
+        ("duration_s", "Visit duration"),
+        ("exposure_s", "Exposure"),
+        ("n_passes", "Passes"),
+    ):
+        add(field, f"{title} maps", FIELD_LABELS[field][0] + ".", plot_tube_grid, time_maps, field)
+    add(
+        "time_s",
+        "Observation-time maps",
+        "Mean LST of each pixel's daily visit.",
+        plot_tube_grid,
+        time_maps,
+        "time_s",
+    )
+    add(
+        "side", "Scan side", "Azimuth range of each visit (east = rising).", plot_tube_grid, time_maps, "side"
+    )
+    add(
+        "coverage",
+        "Coverage union",
+        "Number of tubes that observe each pixel in a day.",
+        plot_coverage,
+        time_maps,
+    )
+    add(
+        "layout",
+        "Tube layout",
+        "Hex focal plane; circles are 1.25&deg; fields of view.",
+        plot_layout,
+        time_maps,
+    )
+    add(
+        "table_checks",
+        "ObsTable checks",
+        "Rows per (tube, pixel, day), and example cadence.",
+        plot_table_checks,
+        table,
+        start_mjd,
     )
     if (args.outdir / "before.png").exists():
         entries.append(("before.png", "Previous implementation (for comparison)", "Analytic model output."))
 
-    observed = time_maps["maps"][0] > 0
+    fields = dict(zip(MAP_FIELDS, time_maps["maps"], strict=True))
+    observed = fields["hits"] > 0
     dec = np.degrees(time_maps["maps"].posmap()[0])
     summary = {
         "Mode": "debug" if args.debug else "full",
-        "Resolution (deg)": time_maps["res_deg"],
-        "Sample interval (s)": time_maps["dt_s"],
-        "Detector grid spacing (deg)": time_maps["det_spacing_deg"],
+        "Resolution (deg) / sample interval (s)": f"{time_maps['res_deg']} / {time_maps['dt_s']:.3f}",
         "Block length (h)": time_maps["block_hours"],
         "Tubes": ", ".join(map(str, time_maps["tubes"])),
         "Start / days": f"{args.start} / {args.days:g}",
         "ObsTable rows": f"{len(table):,}",
         "Observed Dec range (deg)": f"{dec[observed.any(0)].min():.1f} to {dec[observed.any(0)].max():.1f}",
-        "Median exposure per tube-day (s)": f"{np.median(time_maps['maps'][3][observed]):.2f}",
+        "Per tube visit: median duration (min) / exposure (s) / passes": " / ".join(
+            f"{np.median(fields[key][observed]) * scale:.1f}"
+            for key, scale in (("duration_s", 1 / 60), ("exposure_s", 1), ("n_passes", 1))
+        ),
         "East / west fraction": "/".join(
-            f"{np.mean(time_maps['maps'][2][observed] == i):.2f}" for i in range(len(SIDE_NAMES))
+            f"{np.mean(fields['side'][observed] == i):.2f}" for i in range(len(SIDE_NAMES))
         ),
     }
+    for band, values in cadence.items():
+        summary[f"{band}: median revisit (h) / visits per day / span (min) / exposure (s)"] = " / ".join(
+            f"{values[key]:.2f}" for key in ("gaps", "per_day", "span", "exposure")
+        )
+    for key, (p50, p90) in errors.items():
+        summary[f"Pixelization |error| in {key}: median / 90%"] = f"{p50:.2f} / {p90:.2f}"
     write_report(args.outdir, entries, summary)
     print(f"Wrote {args.outdir / 'report.html'}")
 

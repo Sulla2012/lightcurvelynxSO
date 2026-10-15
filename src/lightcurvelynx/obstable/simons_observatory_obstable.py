@@ -14,7 +14,7 @@ Idealized scan model
   range in blocks of ``block_hours``, phased so that the first block starts at LST = 0.
 * Azimuth follows a triangle wave at 1 deg/s with instantaneous turnarounds.
 * 13 tubes of 1.25 deg diameter in a hex pattern (1.75 deg spacing, half the outer ring
-  missing); 8 MF, 4 UHF, 1 LF. Detector positions are sampled on a grid within each tube.
+  missing); 8 MF, 4 UHF, 1 LF. A pixel is hit whenever its center is inside a tube's FoV.
 * Each pixel is observed at most once per tube per sidereal day: if it is crossed in both the
   east and west ranges only the crossing with more hits is kept.
 """
@@ -34,10 +34,10 @@ SO_LATITUDE_DEG = -(22.0 + 57.0 / 60.0 + 31.0 / 3600.0)
 SO_LONGITUDE_DEG = -(67.0 + 47.0 / 60.0 + 15.0 / 3600.0)
 SO_TUBE_FILTERS = ("MF",) * 8 + ("UHF",) * 4 + ("LF",)
 SIDEREAL_DAY_S = 86164.0905
-MAP_FIELDS = ("hits", "time_s", "side", "exposure_s")
+MAP_FIELDS = ("hits", "time_s", "side", "start_s", "duration_s", "exposure_s", "n_passes")
 SIDE_NAMES = ("east", "west")
 _SCALAR_SCAN_KEYS = ("elevation_deg", "speed_deg_s", "block_hours", "fov_deg", "tube_spacing_deg")
-_HEADER_KEYS = ("res_deg", "dt_s", "det_spacing_deg", "lat_deg", *_SCALAR_SCAN_KEYS)
+_HEADER_KEYS = ("res_deg", "dt_s", "lat_deg", *_SCALAR_SCAN_KEYS)
 SCAN_DEFAULTS = {
     "elevation_deg": 40.0,
     "az_ranges": ((30.0, 150.0), (210.0, 330.0)),
@@ -75,26 +75,68 @@ def tube_offsets(spacing_deg=1.75):
     return np.vstack(([[0.0, 0.0]], ring(spacing_deg, 0.0), ring(spacing_deg * np.sqrt(3.0), np.pi / 6)))
 
 
-def detector_offsets(fov_deg, spacing_deg):
-    """Return a square grid of detector positions filling a circular tube field of view.
+def tube_pointing(az_deg, el_deg, offsets):
+    """Apply focal-plane tube offsets to boresight pointings (flat-sky approximation).
 
     Parameters
     ----------
-    fov_deg : float
-        Diameter of the field of view in degrees.
-    spacing_deg : float
-        Grid spacing in degrees.
+    az_deg, el_deg : numpy.ndarray
+        Boresight azimuth and elevation in degrees, shape (T,).
+    offsets : numpy.ndarray
+        Tube (cross-elevation, elevation) offsets in degrees, shape (N, 2).
+
+    Returns
+    -------
+    az, el : numpy.ndarray
+        Tube-center azimuth and elevation in degrees, shape (T, N).
+    """
+    az = az_deg[:, None] + offsets[None, :, 0] / np.cos(np.radians(el_deg))[:, None]
+    return az, el_deg[:, None] + offsets[None, :, 1]
+
+
+def angular_separation_deg(lon1, lat1, lon2, lat2):
+    """Return the great-circle separation (haversine) between positions in degrees.
+
+    Parameters
+    ----------
+    lon1, lat1, lon2, lat2 : numpy.ndarray
+        Longitudes (RA or azimuth) and latitudes (Dec or elevation) in degrees.
 
     Returns
     -------
     numpy.ndarray
-        Array of shape (N, 2) with the (cross-elevation, elevation) offsets in degrees.
+        Angular separation in degrees.
     """
-    n = int(np.floor(0.5 * fov_deg / spacing_deg))
-    grid = np.arange(-n, n + 1) * spacing_deg
-    dx, dy = (g.ravel() for g in np.meshgrid(grid, grid))
-    keep = np.hypot(dx, dy) <= 0.5 * fov_deg + 1e-9
-    return np.column_stack((dx[keep], dy[keep]))
+    lon1, lat1, lon2, lat2 = (np.radians(v) for v in (lon1, lat1, lon2, lat2))
+    h = np.sin(0.5 * (lat2 - lat1)) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(0.5 * (lon2 - lon1)) ** 2
+    return np.degrees(2.0 * np.arcsin(np.sqrt(np.clip(h, 0.0, 1.0))))
+
+
+def scan_time_step(res_deg, speed_deg_s, az_ranges, dt_s=None, **_):
+    """Choose the sample interval so that one azimuth sweep is an integer number of samples.
+
+    Parameters
+    ----------
+    res_deg : float
+        Map resolution in degrees; the default step moves the boresight half a pixel.
+    speed_deg_s : float
+        Azimuth scan speed in degrees per second.
+    az_ranges : tuple
+        Scan azimuth ranges; the first range sets the sweep duration.
+    dt_s : float, optional
+        Requested (maximum) sample interval in seconds.
+
+    Returns
+    -------
+    dt_s : float
+        Sample interval in seconds.
+    samples_per_sweep : int
+        Number of samples in one one-way azimuth sweep.
+    """
+    sweep_s = (az_ranges[0][1] - az_ranges[0][0]) / speed_deg_s
+    requested = res_deg / (2.0 * speed_deg_s) if dt_s is None else dt_s
+    samples_per_sweep = int(np.ceil(sweep_s / requested))
+    return sweep_s / samples_per_sweep, samples_per_sweep
 
 
 def boresight_azel(t_s, *, elevation_deg, az_ranges, speed_deg_s, block_hours, **_):
@@ -182,14 +224,18 @@ def simulate_time_maps(
     res_deg=0.5,
     *,
     tubes=None,
-    dec_range=(-80.0, 35.0),
+    dec_range=(-70.0, 30.0),
     dt_s=None,
-    det_spacing_deg=None,
     lat_deg=SO_LATITUDE_DEG,
     max_points=4_000_000,
     **scan_kwargs,
 ):
-    """Simulate one sidereal day of SO scanning and accumulate per-tube time and hit maps.
+    """Simulate one sidereal day of SO scanning and accumulate per-tube visit maps.
+
+    At every time sample, each map pixel whose center lies within a tube's circular field of view
+    is hit, so all statistics are exact for the pixel-center position up to the sample interval.
+    A pixel is typically crossed once while rising (east range) and once while setting (west
+    range); only the crossing with more hits is kept for each tube.
 
     Parameters
     ----------
@@ -200,87 +246,199 @@ def simulate_time_maps(
     dec_range : tuple
         (min, max) declination of the map in degrees.
     dt_s : float, optional
-        Sample interval in seconds. Defaults to res_deg / (2 * speed) so the scan moves at most
-        half a pixel per sample.
-    det_spacing_deg : float, optional
-        Spacing of the sampled detector grid. Defaults to min(res_deg, fov / 4).
+        Maximum sample interval in seconds. Defaults to res_deg / (2 * speed); it is reduced so
+        each azimuth sweep holds an integer number of samples.
     lat_deg : float
         Site latitude in degrees.
     max_points : int
-        Maximum number of pointing samples processed per chunk (memory control).
+        Maximum number of (time, tube, pixel) candidates processed per chunk (memory control).
     **scan_kwargs
         Overrides of ``SCAN_DEFAULTS``.
 
     Returns
     -------
     dict
-        ``maps``: enmap of shape (4, ntube, ny, nx) holding, per tube, the number of detector
-        samples (``hits``), the circular mean observation time in seconds since LST = 0
-        (``time_s``, NaN where unobserved), the scan side used (``side``, 0 = east, 1 = west,
-        -1 unobserved) and the time in seconds the pixel spends inside the tube field of view
-        (``exposure_s``). Also contains ``tubes`` and all scan parameters.
+        ``maps``: enmap of shape (len(MAP_FIELDS), ntube, ny, nx). Per tube and pixel it holds the
+        number of in-FoV samples (``hits``), the circular mean time of the visit (``time_s``),
+        the scan side (``side``: 0 = east, 1 = west, -1 unobserved), the first in-FoV time
+        (``start_s``), the visit length from first to last in-FoV sample (``duration_s``), the
+        total time inside the FoV (``exposure_s``) and the number of azimuth sweeps that pass over
+        the pixel (``n_passes``). Times are seconds since LST = 0; unobserved pixels are NaN.
+        Also contains ``tubes``, ``res_deg``, ``dt_s``, ``lat_deg`` and the scan parameters.
     """
     _require_pixell()
     scan = {**SCAN_DEFAULTS, **scan_kwargs}
     tubes = np.arange(13) if tubes is None else np.atleast_1d(tubes).astype(int)
-    dt_s = res_deg / (2.0 * scan["speed_deg_s"]) if dt_s is None else dt_s
-    det_spacing_deg = min(res_deg, scan["fov_deg"] / 4.0) if det_spacing_deg is None else det_spacing_deg
+    dt_s, per_sweep = scan_time_step(res_deg, dt_s=dt_s, **scan)
     shape, wcs = enmap.band_geometry(np.radians(dec_range), res=np.radians(res_deg))
-    npix = shape[0] * shape[1]
+    ny, nx = shape
+    dec_pix, ra_pix = np.degrees(enmap.posmap(shape, wcs))
+    dec_pix, ra_pix = dec_pix[:, 0], ra_pix[0]
 
-    # All (tube, detector) pointing offsets in the focal plane.
-    dets = detector_offsets(scan["fov_deg"], det_spacing_deg)
+    # Pixel stencil around each tube center that covers the field of view at all declinations.
+    radius = 0.5 * scan["fov_deg"]
+    max_dec = min(89.0, max(map(abs, dec_range)) + radius)
+    hy = int(np.ceil(radius / res_deg + 0.5))
+    hx = int(np.ceil(radius / (res_deg * np.cos(np.radians(max_dec))) + 0.5))
+    dy, dx = (g.ravel() for g in np.meshgrid(np.arange(-hy, hy + 1), np.arange(-hx, hx + 1), indexing="ij"))
     centers = tube_offsets(scan["tube_spacing_deg"])[tubes]
-    offsets = (centers[:, None, :] + dets[None, :, :]).reshape(-1, 2)
-    tube_of = np.repeat(np.arange(len(tubes)), len(dets))
 
-    nbins = len(tubes) * 2 * npix
-    hits, cos_sum, sin_sum = np.zeros(nbins), np.zeros(nbins), np.zeros(nbins)
-    times = np.arange(0.0, SIDEREAL_DAY_S, dt_s)
-    chunk = max(1, max_points // len(offsets))
-    for start in range(0, len(times), chunk):
-        t = times[start : start + chunk]
+    nbins = len(tubes) * 2 * ny * nx
+    hits, cos_sum, sin_sum, passes = (np.zeros(nbins) for _ in range(4))
+    t_min, t_min_shift = np.full(nbins, np.inf), np.full(nbins, np.inf)
+    t_max, t_max_shift = np.full(nbins, -np.inf), np.full(nbins, -np.inf)
+    n_samples = int(np.ceil(SIDEREAL_DAY_S / dt_s))
+    n_sweeps = n_samples // per_sweep + 1
+    chunk = max(1, max_points // (len(tubes) * len(dy) * per_sweep)) * per_sweep  # whole sweeps
+    for start in range(0, n_samples, chunk):
+        k = np.arange(start, min(start + chunk, n_samples))
+        t = k * dt_s
         az, el, side = boresight_azel(t, **scan)
-        point_az = az[:, None] + offsets[None, :, 0] / np.cos(np.radians(el))[:, None]
-        point_el = el[:, None] + offsets[None, :, 1]
-        ra, dec = horizon_to_equatorial(point_az, point_el, (360.0 * t / SIDEREAL_DAY_S)[:, None], lat_deg)
-        pix = sky_to_pixel(shape, wcs, ra, dec).reshape(ra.shape)
-        bins = ((tube_of[None, :] * 2 + side[:, None]) * npix + pix).ravel()
-        phase = np.repeat(2.0 * np.pi * t / SIDEREAL_DAY_S, len(offsets))
-        good = pix.ravel() >= 0
-        bins, phase = bins[good], phase[good]
+        tube_az, tube_el = tube_pointing(az, el, centers)
+        ra_c, dec_c = horizon_to_equatorial(tube_az, tube_el, (360.0 * t / SIDEREAL_DAY_S)[:, None], lat_deg)
+        center_pix = sky_to_pixel(shape, wcs, ra_c, dec_c).reshape(ra_c.shape)[..., None]
+        y = center_pix // nx + dy
+        x = (center_pix % nx + dx) % nx
+        inside = (center_pix >= 0) & (y >= 0) & (y < ny)
+        y = np.clip(y, 0, ny - 1)
+        inside &= angular_separation_deg(ra_pix[x], dec_pix[y], ra_c[..., None], dec_c[..., None]) <= radius
+        it, itube, _ = np.nonzero(inside)
+        bins = ((itube * 2 + side[it]) * ny + y[inside]) * nx + x[inside]
+        tt = t[it]
+        phase = 2.0 * np.pi * tt / SIDEREAL_DAY_S
         hits += np.bincount(bins, minlength=nbins)
         cos_sum += np.bincount(bins, weights=np.cos(phase), minlength=nbins)
         sin_sum += np.bincount(bins, weights=np.sin(phase), minlength=nbins)
+        # Track first/last times both directly and shifted by half a day, so visits that wrap
+        # around LST = 0 still get the correct (shorter) span.
+        shifted = (tt + 0.5 * SIDEREAL_DAY_S) % SIDEREAL_DAY_S
+        np.minimum.at(t_min, bins, tt)
+        np.maximum.at(t_max, bins, tt)
+        np.minimum.at(t_min_shift, bins, shifted)
+        np.maximum.at(t_max_shift, bins, shifted)
+        sweeps = np.unique(bins.astype(np.int64) * n_sweeps + k[it] // per_sweep)
+        passes += np.bincount(sweeps // n_sweeps, minlength=nbins)
 
-    # Keep only the side (crossing) with more hits so each pixel is observed once per day.
-    hits, cos_sum, sin_sum = (a.reshape(len(tubes), 2, *shape) for a in (hits, cos_sum, sin_sum))
-    best = np.argmax(hits, axis=1)[:, None]
-    pick = lambda a: np.take_along_axis(a, best, axis=1)[:, 0]  # noqa: E731
-    best_hits = pick(hits)
-    observed = best_hits > 0
-    mean_phase = np.arctan2(pick(sin_sum), pick(cos_sum)) % (2.0 * np.pi)
-    pixel_area_deg2 = np.degrees(np.degrees(enmap.pixsizemap(shape, wcs)))
-    maps = enmap.enmap(
-        np.stack(
-            [
-                best_hits,
-                np.where(observed, mean_phase * SIDEREAL_DAY_S / (2.0 * np.pi), np.nan),
-                np.where(observed, best[:, 0], -1),
-                best_hits * dt_s * det_spacing_deg**2 / pixel_area_deg2,
-            ]
-        ),
-        wcs,
+    # Keep the side (crossing) with more hits for each tube and pixel.
+    arrays = [a.reshape(len(tubes), 2, ny, nx) for a in (hits, cos_sum, sin_sum, passes)]
+    arrays += [a.reshape(len(tubes), 2, ny, nx) for a in (t_min, t_max, t_min_shift, t_max_shift)]
+    best = np.argmax(arrays[0], axis=1)[:, None]
+    hits, cos_sum, sin_sum, passes, t_min, t_max, t_min_shift, t_max_shift = (
+        np.take_along_axis(a, best, axis=1)[:, 0] for a in arrays
     )
+    observed = hits > 0
+    span, span_shift = t_max - t_min, t_max_shift - t_min_shift
+    use_shift = span_shift < span
+    with np.errstate(invalid="ignore"):  # Unobserved pixels have infinite bounds.
+        start_s = np.where(use_shift, (t_min_shift - 0.5 * SIDEREAL_DAY_S) % SIDEREAL_DAY_S, t_min)
+    mean_s = (np.arctan2(sin_sum, cos_sum) % (2.0 * np.pi)) * SIDEREAL_DAY_S / (2.0 * np.pi)
+    nan_if_unobserved = lambda a: np.where(observed, a, np.nan)  # noqa: E731
+    fields = {
+        "hits": hits,
+        "time_s": nan_if_unobserved(mean_s),
+        "side": np.where(observed, best[:, 0], -1),
+        "start_s": nan_if_unobserved(start_s),
+        "duration_s": nan_if_unobserved(np.where(use_shift, span_shift, span) + dt_s),
+        "exposure_s": hits * dt_s,
+        "n_passes": passes,
+    }
     return {
-        "maps": maps,
+        "maps": enmap.enmap(np.stack([fields[name] for name in MAP_FIELDS]), wcs),
         "tubes": tubes,
         "res_deg": float(res_deg),
         "dt_s": float(dt_s),
-        "det_spacing_deg": float(det_spacing_deg),
         "lat_deg": float(lat_deg),
         **scan,
     }
+
+
+def equatorial_to_horizon(ra_deg, dec_deg, lst_deg, lat_deg=SO_LATITUDE_DEG):
+    """Convert equatorial coordinates to horizon coordinates (no refraction or aberration).
+
+    Parameters
+    ----------
+    ra_deg, dec_deg : float or numpy.ndarray
+        Right ascension and declination in degrees.
+    lst_deg : numpy.ndarray
+        Local sidereal time in degrees.
+    lat_deg : float
+        Site latitude in degrees.
+
+    Returns
+    -------
+    az, el : numpy.ndarray
+        Azimuth (east of north) in [0, 360) and elevation in degrees.
+    """
+    hour_angle, dec, lat = np.radians(lst_deg - ra_deg), np.radians(dec_deg), np.radians(lat_deg)
+    sin_el = np.sin(lat) * np.sin(dec) + np.cos(lat) * np.cos(dec) * np.cos(hour_angle)
+    az = np.arctan2(
+        -np.cos(dec) * np.sin(hour_angle),
+        np.sin(dec) * np.cos(lat) - np.cos(dec) * np.sin(lat) * np.cos(hour_angle),
+    )
+    return np.degrees(az) % 360.0, np.degrees(np.arcsin(np.clip(sin_el, -1.0, 1.0)))
+
+
+def point_visits(
+    ra, dec, tube_id, *, res_deg=0.5, dt_s=None, lat_deg=SO_LATITUDE_DEG, max_gap_s=1800.0, **scan_kwargs
+):
+    """Trace when one sky position is inside a tube's field of view over one sidereal day.
+
+    This is an independent, single-point reference for ``simulate_time_maps``: it converts the
+    source into horizon coordinates and tests its separation from the tube center there. Pass a
+    ``simulate_time_maps`` result as keyword arguments to use the same scan and time step.
+
+    Parameters
+    ----------
+    ra, dec : float
+        Source position in degrees.
+    tube_id : int
+        Optics-tube index.
+    res_deg, dt_s : float, optional
+        Used to choose the sample interval as in ``simulate_time_maps``.
+    lat_deg : float
+        Site latitude in degrees.
+    max_gap_s : float
+        In-FoV samples separated by more than this (seconds) belong to different visits.
+    **scan_kwargs
+        Overrides of ``SCAN_DEFAULTS`` (other keys are ignored).
+
+    Returns
+    -------
+    list of dict
+        One entry per visit with ``side``, ``time_s`` (circular mean), ``start_s``,
+        ``duration_s``, ``exposure_s`` and ``n_passes``; times in seconds since LST = 0.
+    """
+    scan = {key: scan_kwargs.get(key, value) for key, value in SCAN_DEFAULTS.items()}
+    dt_s, per_sweep = scan_time_step(res_deg, dt_s=dt_s, **scan)
+    k = np.arange(int(np.ceil(SIDEREAL_DAY_S / dt_s)))
+    t = k * dt_s
+    az, el, side = boresight_azel(t, **scan)
+    tube_az, tube_el = tube_pointing(az, el, tube_offsets(scan["tube_spacing_deg"])[[tube_id]])
+    src_az, src_el = equatorial_to_horizon(ra, dec, 360.0 * t / SIDEREAL_DAY_S, lat_deg)
+    inside = np.flatnonzero(
+        angular_separation_deg(tube_az[:, 0], tube_el[:, 0], src_az, src_el) <= 0.5 * scan["fov_deg"]
+    )
+    if len(inside) == 0:
+        return []
+    groups = np.split(inside, np.flatnonzero(np.diff(t[inside]) > max_gap_s) + 1)
+    unwrapped = [k[g].astype(float) for g in groups]
+    if len(groups) > 1 and t[groups[0][0]] < max_gap_s and t[groups[-1][-1]] > SIDEREAL_DAY_S - max_gap_s:
+        unwrapped[0] = np.concatenate((unwrapped.pop() - len(k), unwrapped[0]))
+        groups[0] = np.concatenate((groups.pop(), groups[0]))
+    visits = []
+    for g, ku in zip(groups, unwrapped, strict=True):
+        times = ku * dt_s
+        visits.append(
+            {
+                "side": int(np.bincount(side[g]).argmax()),
+                "time_s": times.mean() % SIDEREAL_DAY_S,
+                "start_s": times[0] % SIDEREAL_DAY_S,
+                "duration_s": times[-1] - times[0] + dt_s,
+                "exposure_s": len(g) * dt_s,
+                "n_passes": len(np.unique(k[g] // per_sweep)),
+            }
+        )
+    return visits
 
 
 def write_time_maps(fname, time_maps):
@@ -332,10 +490,12 @@ def read_time_maps(fname):
 class SimonsObservatoryObsTable(ObsTable):
     """An ObsTable of Simons Observatory map-pixel observations for one or more optics tubes.
 
-    Each row is one effective observation of one map pixel by one tube on one day: ``ra`` and
-    ``dec`` are the pixel center, ``time`` the hit-weighted mean observation time (MJD), ``hits``
-    the number of detector samples, and ``exposure_s`` the time (seconds) the pixel spent inside the
-    tube's field of view. Rows are normally created with ``from_time_maps``/``create_tube_tables``.
+    Each row is one visit of one map pixel by one tube on one day. ``ra`` and ``dec`` are the pixel
+    center and ``time`` is the mean in-FoV time of the visit (MJD). ``time_start``/``time_end``
+    (MJD) and ``duration_s`` give the span from the first to the last in-FoV sample, ``exposure_s``
+    the total time inside the tube's field of view (s), ``n_passes`` the number of azimuth sweeps
+    over the pixel, and ``hits`` the number of in-FoV samples. Rows are normally created with
+    ``from_time_maps``.
 
     Spatial queries map a position to its map pixel instead of using a cone search, so each source
     matches exactly the rows of the pixel that contains it.
@@ -402,24 +562,40 @@ class SimonsObservatoryObsTable(ObsTable):
 
         pieces = []
         for tube in tubes:
-            hits, time_s, side, exposure = maps[:, map_tubes.index(tube)].reshape(4, -1)
-            pixels = np.flatnonzero(hits > 0)
-            mjd = lst0_mjd + (days[:, None] * SIDEREAL_DAY_S + time_s[pixels][None, :]) / 86400.0
+            fields = dict(
+                zip(MAP_FIELDS, maps[:, map_tubes.index(tube)].reshape(len(MAP_FIELDS), -1), strict=True)
+            )
+            pixels = np.flatnonzero(fields["hits"] > 0)
+            mjd = lst0_mjd + (days[:, None] * SIDEREAL_DAY_S + fields["time_s"][pixels][None, :]) / 86400.0
             keep = (mjd >= start_mjd) & (mjd < start_mjd + n_days)
             pix = np.broadcast_to(pixels, mjd.shape)[keep]
+            # Start relative to the mean time, wrapped so visits spanning LST = 0 stay contiguous.
+            start_offset_s = (
+                fields["start_s"][pix] - fields["time_s"][pix] + 0.5 * SIDEREAL_DAY_S
+            ) % SIDEREAL_DAY_S
+            time_start = mjd[keep] + (start_offset_s - 0.5 * SIDEREAL_DAY_S) / 86400.0
             pieces.append(
                 pd.DataFrame(
                     {
                         "time": mjd[keep],
-                        "filter": filter_names[tube],
-                        "tube_id": int(tube),
-                        "side": np.asarray(SIDE_NAMES)[side[pix].astype(int)],
-                        "hits": hits[pix],
-                        "exposure_s": exposure[pix],
-                        "pixel_index": pix,
+                        "time_start": time_start,
+                        "time_end": time_start + fields["duration_s"][pix] / 86400.0,
+                        "filter": pd.Categorical.from_codes(np.zeros(len(pix), int), [filter_names[tube]]),
+                        "tube_id": np.full(len(pix), tube, dtype=np.int16),
+                        "side": pd.Categorical.from_codes(fields["side"][pix].astype(int), SIDE_NAMES),
+                        **{
+                            name: fields[name][pix].astype(np.float32)
+                            for name in ("hits", "duration_s", "exposure_s", "n_passes")
+                        },
+                        "pixel_index": pix.astype(np.int32),
                     }
                 )
             )
+        # Categorical columns keep large multi-tube tables compact (union_categoricals on concat).
+        for column in ("filter", "side"):
+            categories = sorted({c for piece in pieces for c in piece[column].cat.categories})
+            for piece in pieces:
+                piece[column] = piece[column].cat.set_categories(categories)
         table = pd.concat(pieces, ignore_index=True).sort_values("time", ignore_index=True)
         dec, ra = np.degrees(np.asarray(maps.posmap()).reshape(2, -1)[:, table["pixel_index"].to_numpy()])
         table["ra"], table["dec"] = ra % 360.0, dec

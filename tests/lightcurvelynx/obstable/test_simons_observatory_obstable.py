@@ -10,13 +10,16 @@ from lightcurvelynx.astro_utils.passbands import PassbandGroup  # noqa: E402
 from lightcurvelynx.models.basic_models import ConstantSEDModel  # noqa: E402
 from lightcurvelynx.noise_models.base_noise_models import GivenNoiseModel  # noqa: E402
 from lightcurvelynx.obstable.simons_observatory_obstable import (  # noqa: E402
+    MAP_FIELDS,
+    SIDE_NAMES,
     SIDEREAL_DAY_S,
     SO_LATITUDE_DEG,
     SO_LONGITUDE_DEG,
     SimonsObservatoryObsTable,
     boresight_azel,
-    detector_offsets,
+    equatorial_to_horizon,
     horizon_to_equatorial,
+    point_visits,
     read_time_maps,
     simulate_time_maps,
     tube_offsets,
@@ -48,8 +51,6 @@ def test_tube_layout():
     dist = np.hypot(*(offsets[:, None, :] - offsets[None, :, :]).T)
     np.fill_diagonal(dist, np.inf)
     assert np.allclose(dist.min(axis=0), 1.75)
-    dets = detector_offsets(1.25, 0.3125)
-    assert len(dets) == 13 and np.all(np.hypot(*dets.T) <= 0.625 + 1e-9)
 
 
 def test_boresight_schedule():
@@ -83,17 +84,46 @@ def test_horizon_to_equatorial_matches_astropy():
 def test_time_map_coverage(time_maps):
     """Observed declinations match the analytic range of the az 30-150 / 210-330 scan."""
     maps = time_maps["maps"]
-    assert maps.shape[:2] == (4, 2)
-    hits, time_s, side, exposure = maps
-    observed = hits > 0
-    assert np.array_equal(observed, np.isfinite(time_s))
-    assert np.all(side[observed] >= 0) and np.all(side[~observed] == -1)
-    assert np.all(exposure[observed] > 0)
+    assert maps.shape[:2] == (len(MAP_FIELDS), 2)
+    fields = dict(zip(MAP_FIELDS, maps, strict=True))
+    observed = fields["hits"] > 0
+    assert np.array_equal(observed, np.isfinite(fields["time_s"]))
+    assert np.all(fields["side"][observed] >= 0) and np.all(fields["side"][~observed] == -1)
+    assert np.allclose(fields["exposure_s"], fields["hits"] * time_maps["dt_s"])
+    assert np.all(fields["duration_s"][observed] >= fields["exposure_s"][observed])
+    assert np.all(fields["n_passes"][observed] >= 1)
+    time_s = fields["time_s"]
     assert np.all((time_s[observed] >= 0) & (time_s[observed] < SIDEREAL_DAY_S))
     dec = np.degrees(maps.posmap()[0])
     for obs in observed:
         assert -63.0 < dec[obs].min() < -55.0
         assert 17.0 < dec[obs].max() < 25.0
+
+
+def test_horizon_round_trip():
+    """Equatorial -> horizon -> equatorial returns the input position."""
+    rng = np.random.default_rng(3)
+    ra, dec, lst = rng.uniform(0, 360, 100), rng.uniform(-80, 20, 100), rng.uniform(0, 360, 100)
+    az, el = equatorial_to_horizon(ra, dec, lst)
+    ra2, dec2 = horizon_to_equatorial(az, el, lst)
+    assert np.allclose(np.cos(np.radians(ra - ra2)), 1.0) and np.allclose(dec, dec2)
+
+
+def test_map_visits_match_point_trace(time_maps):
+    """Visit statistics at pixel centers agree with the independent single-point trace."""
+    fields = dict(zip(MAP_FIELDS, time_maps["maps"], strict=True))
+    dec, ra = np.degrees(time_maps["maps"].posmap())
+    rng = np.random.default_rng(4)
+    for index, tube in enumerate(time_maps["tubes"]):
+        observed = np.argwhere(fields["hits"][index] > 0)
+        for y, x in observed[rng.choice(len(observed), 10, replace=False)]:
+            side = fields["side"][index, y, x]
+            visits = [v for v in point_visits(ra[y, x], dec[y, x], tube, **time_maps) if v["side"] == side]
+            visit = max(visits, key=lambda v: v["exposure_s"])
+            for key in ("duration_s", "exposure_s", "n_passes", "start_s"):
+                assert fields[key][index, y, x] == pytest.approx(visit[key], abs=0.01)
+            dt = (fields["time_s"][index, y, x] - visit["time_s"] + 0.5 * SIDEREAL_DAY_S) % SIDEREAL_DAY_S
+            assert dt == pytest.approx(0.5 * SIDEREAL_DAY_S, abs=0.01)
 
 
 def test_table_pointing_matches_astropy(table):
@@ -118,6 +148,10 @@ def test_table_one_observation_per_sidereal_day(table):
     for _, group in table._table.groupby(["tube_id", "pixel_index"]):
         assert np.allclose(np.diff(group["time"]), SIDEREAL_DAY_S / 86400.0)
     assert set(table.filters) == {"MF", "UHF"}
+    df = table._table
+    assert np.all((df["time_start"] <= df["time"]) & (df["time"] <= df["time_end"]))
+    assert np.allclose((df["time_end"] - df["time_start"]) * 86400.0, df["duration_s"])
+    assert set(df["side"]) <= set(SIDE_NAMES)
 
 
 def test_range_search(table):

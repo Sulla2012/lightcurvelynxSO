@@ -81,15 +81,17 @@ The ``ArgusObsTable`` class stores pointing and noise information from simulatio
 Simons Observatory (SimonsObservatoryObsTable)
 -------------------------------------------------------------------------------
 The Simons Observatory (SO) scans continuously in azimuth at a fixed elevation instead of taking
-discrete pointings. ``simulate_time_maps`` simulates one sidereal day of an idealized scan and,
-using `pixell <https://github.com/simonsobs/pixell>`__, accumulates per-pixel hit counts and mean
-observation times for each of the 13 optics tubes. ``SimonsObservatoryObsTable.from_time_maps``
-then materializes those maps into a standard ``ObsTable`` with one row per (tube, observed
-pixel, day). ``ra``/``dec`` are the pixel center and ``time`` is the hit-weighted mean time of the
-crossing. The extra columns ``tube_id``, ``side`` (``east``/``west``), ``hits`` and ``exposure_s``
-(seconds the pixel spends in the tube's field of view) can drive a noise model. A source matches
-exactly the rows of the map pixel that contains it, so the standard ``simulate_lightcurves`` path
-is used.
+discrete pointings. ``simulate_time_maps`` simulates one sidereal day of an idealized scan with
+`pixell <https://github.com/simonsobs/pixell>`__. At every time sample it finds the map pixels whose
+centers lie inside each of the 13 optics tubes' fields of view. From those hits it records, per tube
+and pixel, the visit's mean time, start, duration (first to last in-FoV sample), exposure (total
+seconds in the FoV) and the number of azimuth sweeps over the pixel. These values are exact for the
+pixel center, up to the sample interval; ``point_visits`` traces a single position independently and
+is used to validate them. ``SimonsObservatoryObsTable.from_time_maps`` turns the maps into a standard
+``ObsTable`` with one row per (tube, observed pixel, day). It has the columns ``time`` (mean, MJD),
+``time_start``, ``time_end``, ``duration_s``, ``exposure_s``, ``n_passes``, ``hits``, ``side``
+(``east``/``west``), ``tube_id`` and ``pixel_index``. A source matches exactly the rows of the map
+pixel that contains it, so the standard ``simulate_lightcurves`` path is used.
 
 The idealized scan model:
 
@@ -121,9 +123,12 @@ Because of the azimuth throws, coverage spans roughly Dec -59 to +21 deg, plus t
     table.add_column("bandflux_error", sigma_1s / np.sqrt(table["exposure_s"]))
     survey = SurveyInfo(table, passbands=passbands, noise_model=GivenNoiseModel())
 
-Building a table for all tubes over a long survey at fine resolution can produce a very large
-table. Build one table per tube (or per band) and keep the resolution at roughly 0.5 deg or
-coarser. ``analysis/visualize_simons_observatory_obstable.py`` (use ``--debug`` for a quick run)
+For tubes on the same band, visits a few minutes apart are effectively one telescope visit. Each
+tube keeps its own crossing (rising or setting), so a source can be visited twice per day by
+different tubes. Tables are large: all 13 tubes at 0.5 deg have about 1.2M rows per day and need
+about 0.3 kB per row, so build one table per band (or per tube) for long surveys. At 0.5 deg, the
+pixelization error for arbitrary source positions is about 30 s (median) in visit time and up to one
+sweep (about 2 minutes) in duration. ``analysis/visualize_simons_observatory_obstable.py`` (use ``--debug`` for a quick run)
 simulates the maps, builds the table, and writes an HTML report of diagnostic plots to
 ``analysis/so_report/``.
 
