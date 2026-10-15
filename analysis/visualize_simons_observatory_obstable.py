@@ -28,15 +28,21 @@ from lightcurvelynx.obstable.simons_observatory_obstable import (  # noqa: E402
     MAP_FIELDS,
     SIDE_NAMES,
     SIDEREAL_DAY_S,
+    SO_LONGITUDE_DEG,
     SO_TUBE_FILTERS,
     SimonsObservatoryObsTable,
     point_visits,
     read_time_maps,
+    simulate_downtime,
     simulate_time_maps,
     sky_to_pixel,
+    survey_epoch,
     tube_offsets,
+    visit_schedule,
     write_time_maps,
 )
+
+YEAR_DAYS = 365.25
 
 # Field -> (colorbar label, colormap, scale factor applied before plotting).
 FIELD_LABELS = {
@@ -66,12 +72,19 @@ def parse_args():
     parser.add_argument(
         "--first-side", type=int, default=0, help="Side of the first day (0 rising, 1 setting)."
     )
+    parser.add_argument("--uptime", type=float, default=0.65, help="Instrument uptime fraction.")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed for the downtime realization.")
+    parser.add_argument(
+        "--epoch", type=float, help="Precession epoch (MJD); default is mid-way through the year."
+    )
     parser.add_argument("--outdir", type=Path, default=Path("analysis/so_report"), help="Report directory.")
     parser.add_argument("--overwrite", action="store_true", help="Re-simulate even if cached maps exist.")
     parser.add_argument("--debug", action="store_true", help="Quick run: 2 deg pixels, tubes 0 1 12, 3 days.")
     args = parser.parse_args()
     if args.debug:
         args.res, args.tubes, args.days = 2.0, [0, 1, 12], 3.0
+    if args.epoch is None:
+        args.epoch = survey_epoch(args.start)[0] + YEAR_DAYS / 2.0
     return args
 
 
@@ -88,13 +101,13 @@ def load_or_simulate(args):
     dict
         Time maps as returned by ``simulate_time_maps``.
     """
-    tag = f"res{args.res:g}_sides_tubes{'-'.join(map(str, args.tubes))}"
+    tag = f"res{args.res:g}_ep{args.epoch:.0f}_tubes{'-'.join(map(str, args.tubes))}"
     fname = args.outdir / f"time_maps_{tag}.fits"
     if fname.exists() and not args.overwrite:
         print(f"Reading cached time maps from {fname}")
         return read_time_maps(fname)
     print(f"Simulating one sidereal day for tubes {args.tubes} at {args.res} deg...", flush=True)
-    time_maps = simulate_time_maps(args.res, tubes=args.tubes)
+    time_maps = simulate_time_maps(args.res, tubes=args.tubes, epoch_mjd=args.epoch)
     write_time_maps(fname, time_maps)
     return time_maps
 
@@ -252,110 +265,215 @@ def plot_table_checks(table, start_mjd, fname):
     plt.close(fig)
 
 
-def band_side_coverage(time_maps, bands):
-    """Return which pixels each band observes on each scan side, combining the band's tubes.
+def weighted_percentile(values, weights, q):
+    """Return weighted percentiles (inverse of the weighted empirical CDF).
+
+    Parameters
+    ----------
+    values, weights : numpy.ndarray
+        Samples and their weights.
+    q : sequence of float
+        Percentiles in [0, 100].
+
+    Returns
+    -------
+    numpy.ndarray
+        The percentiles.
+    """
+    order = np.argsort(values)
+    cdf = np.cumsum(weights[order]) / np.sum(weights)
+    return values[order][np.minimum(np.searchsorted(cdf, np.asarray(q) / 100.0), len(values) - 1)]
+
+
+def year_visits(time_maps, start, first_side, downtime, block_days=30.0):
+    """Yield the visits of every tube and side over one year, in blocks to bound memory.
 
     Parameters
     ----------
     time_maps : dict
         Output of ``simulate_time_maps``.
-    bands : list of str
-        Band names; "all" combines every simulated tube.
+    start : str
+        Start date (UTC) of the year.
+    first_side : int
+        Scan side of the first transit day.
+    downtime : numpy.ndarray or None
+        Merged downtime intervals (MJD).
+    block_days : float
+        Length of each block in days.
+
+    Yields
+    ------
+    band : str
+        Band of the tube.
+    pixel, transit_day, utc_day : numpy.ndarray
+        Flat pixel index, transit day (counted from the start's LST = 0) and UTC day since start.
+    """
+    start_mjd, lst0_mjd = survey_epoch(start)
+    for begin in np.arange(0.0, YEAR_DAYS, block_days):
+        block_lst0 = survey_epoch(start_mjd + begin)[1]
+        # Transit days of a block count from its own LST = 0; shift them (and the parity) to the year's.
+        offset = int(round((block_lst0 - lst0_mjd) * 86400.0 / SIDEREAL_DAY_S))
+        for tube in time_maps["tubes"]:
+            for side in range(2):
+                visits = visit_schedule(
+                    time_maps,
+                    tube,
+                    side,
+                    start_mjd + begin,
+                    min(block_days, YEAR_DAYS - begin),
+                    first_side=(first_side + offset) % 2,
+                    downtime=downtime,
+                )
+                utc_day = np.floor(visits["time"] - start_mjd).astype(int)
+                yield SO_TUBE_FILTERS[tube], visits["pixel"], visits["transit_day"] + offset, utc_day
+
+
+def year_coverage(time_maps, start, first_side, downtime, area, footprint=None):
+    """Summarize one year of observations per band: daily sky fraction, days observed and revisit gaps.
+
+    Parameters
+    ----------
+    time_maps : dict
+        Output of ``simulate_time_maps``.
+    start : str
+        Start date (UTC) of the year.
+    first_side : int
+        Scan side of the first transit day.
+    downtime : numpy.ndarray or None
+        Merged downtime intervals (MJD).
+    area : numpy.ndarray
+        Flat per-pixel area as a fraction of the full sky.
+    footprint : dict, optional
+        Band -> boolean pixel mask over which days per year are summarized. Defaults to the
+        pixels observed at least once.
 
     Returns
     -------
     dict
-        Band -> boolean array (2, ny, nx) of pixels hit on the rising and setting crossing.
+        Band -> ``daily`` (sky fraction per full UTC day), ``days`` (days observed per pixel),
+        ``footprint`` (pixel mask), and ``gaps``/``gap_weights`` (days between successive observed
+        transit days, weighted by pixel area).
     """
-    hit = time_maps["maps"][MAP_FIELDS.index("hits")] > 0
-    filters = np.array([SO_TUBE_FILTERS[tube] for tube in time_maps["tubes"]])
-    return {band: hit[(filters == band) | (band == "all")].any(axis=0) for band in bands}
+    npix = area.size
+    bands = [*sorted({SO_TUBE_FILTERS[tube] for tube in time_maps["tubes"]}), "all"]
+    n_transit, n_utc = int(YEAR_DAYS * 86400.0 / SIDEREAL_DAY_S) + 3, int(np.ceil(YEAR_DAYS))
+    flags = {band: (np.zeros((npix, n_transit), bool), np.zeros((npix, n_utc), bool)) for band in bands}
+    for band, pixel, transit, utc_day in year_visits(time_maps, start, first_side, downtime):
+        for key in (band, "all"):
+            flags[key][0][pixel, transit + 1] = True
+            flags[key][1][pixel, utc_day] = True
+    stats = {}
+    for band, (transit, utc) in flags.items():
+        rows, cols = np.nonzero(transit)
+        same = rows[1:] == rows[:-1]
+        days = transit.sum(axis=1)
+        stats[band] = {
+            "daily": area @ utc[:, : int(YEAR_DAYS)],
+            "days": days,
+            "footprint": days > 0 if footprint is None else footprint[band],
+            "gaps": np.diff(cols)[same] * SIDEREAL_DAY_S / 86400.0,
+            "gap_weights": area[rows[1:][same]],
+        }
+    return stats
 
 
-def plot_sky_stats(time_maps, table, start_mjd, n_days, fname):
-    """Plot the daily sky fraction observed and the distribution of days per year a pixel is observed.
-
-    Daily coverage is measured from the ObsTable over whole UTC days. Days per year follow from the
-    time maps: on alternate transit days a pixel is observed if the band hits it on that crossing,
-    so it is observed on ``N * (rising + setting) / 2`` of the ``N`` transits in a year.
+def plot_year_coverage(time_maps, ideal, actual, fname):
+    """Plot one year of sky coverage with and without downtime.
 
     Parameters
     ----------
     time_maps : dict
         Output of ``simulate_time_maps``.
-    table : SimonsObservatoryObsTable
-        The materialized observation table.
-    start_mjd : float
-        Survey start (MJD).
-    n_days : float
-        Survey length in days.
+    ideal, actual : dict
+        ``year_coverage`` results without and with downtime.
     fname : Path
         Output image filename.
-
-    Returns
-    -------
-    dict
-        Per band: daily sky fractions, ever-observed fraction and area-weighted days-per-year percentiles.
     """
     maps = time_maps["maps"]
-    area = np.asarray(maps.pixsizemap(broadcastable=False)) / (4.0 * np.pi)  # Fraction of the full sky.
-    bands = [*sorted(table.filters), "all"]
+    area = np.asarray(maps.pixsizemap(broadcastable=False)).ravel() / (4.0 * np.pi)
     colors = {**BAND_COLORS, "all": "k"}
-    df = table._table
-    day = np.floor(df["time"].to_numpy() - start_mjd).astype(int)
-    n_full = int(np.floor(n_days))
-    transits_per_year = 365.25 * 86400.0 / SIDEREAL_DAY_S
-    coverage = band_side_coverage(time_maps, bands)
-
-    fig, axes = plt.subplots(1, 3, figsize=(17, 3.8), gridspec_kw={"width_ratios": [1, 1, 1.6]})
-    stats = {}
-    for offset, band in enumerate(bands):
-        rows = (df["filter"] == band).to_numpy() | (band == "all")
-        daily = [
-            area.ravel()[np.unique(df["pixel_index"].to_numpy()[rows & (day == d)])].sum()
-            for d in range(n_full)
-        ]
-        width = 0.8 / len(bands)
-        axes[0].bar(
-            np.arange(n_full) + (offset - (len(bands) - 1) / 2) * width,
-            daily,
-            width,
-            color=colors[band],
-            label=band,
-        )
-        per_year = transits_per_year * coverage[band].mean(axis=0)
-        seen = per_year > 0
+    fig, axes = plt.subplots(1, 4, figsize=(20, 3.8), gridspec_kw={"width_ratios": [1.3, 1, 1, 1.6]})
+    axes[0].plot(ideal["all"]["daily"], color="0.6", lw=1, label="all, no downtime")
+    for band, values in actual.items():
+        axes[0].plot(values["daily"], color=colors[band], lw=1 if band == "all" else 0.6, label=band)
+        seen = values["footprint"]
+        bins = np.arange(-5, 380, 10)
         axes[1].hist(
-            per_year[seen],
-            bins=np.linspace(0, 370, 38),
-            weights=area[seen],
+            values["days"][seen], bins, weights=area[seen], histtype="step", color=colors[band], label=band
+        )
+        axes[1].hist(
+            ideal[band]["days"][seen], bins, weights=area[seen], histtype="step", ls=":", color=colors[band]
+        )
+        gaps = np.clip(values["gaps"], 0, 30)
+        axes[2].hist(
+            gaps,
+            np.arange(0, 31, 0.5),
+            weights=values["gap_weights"],
+            density=True,
             histtype="step",
-            lw=1.5,
             color=colors[band],
             label=band,
         )
-        order = np.argsort(per_year[seen])
-        cdf = np.cumsum(area[seen][order]) / area[seen].sum()
-        quantiles = per_year[seen][order][np.searchsorted(cdf, [0.1, 0.5, 0.9])]
-        stats[band] = {
-            "daily": daily,
-            "ever": area[seen].sum(),
-            "per_year": quantiles,
-            "full": area[per_year > 0.99 * transits_per_year].sum() / area[seen].sum(),
-        }
-    axes[0].set_xlabel("UTC day since start")
+    axes[0].set_xlabel("UTC day of year since start")
     axes[0].set_ylabel("Fraction of full sky observed")
-    axes[0].legend(fontsize=8)
-    axes[1].set_xlabel("Days per year a pixel is observed")
+    axes[0].legend(fontsize=7, ncol=2, loc="lower left")
+    axes[1].set_xlabel("Days per year a pixel is observed (dotted: no downtime)")
     axes[1].set_ylabel("Sky fraction")
-    axes[1].legend(fontsize=8)
-    image = transits_per_year * coverage["all"].mean(axis=0)
-    artist = sky_imshow(axes[2], np.where(image > 0, image, np.nan), maps, cmap="viridis", vmin=0)
-    fig.colorbar(artist, ax=axes[2], label="Days per year observed (any band)")
+    axes[2].set_xlabel("Revisit gap (days, last bin = 30+)")
+    axes[2].set_ylabel("Area-weighted density")
+    axes[2].set_yscale("log")
+    image = actual["all"]["days"].reshape(maps.shape[-2:]).astype(float)
+    image[~actual["all"]["footprint"].reshape(image.shape)] = np.nan
+    artist = sky_imshow(axes[3], image, maps, cmap="viridis")
+    fig.colorbar(artist, ax=axes[3], label="Days per year observed (any band)")
     fig.tight_layout()
     fig.savefig(fname, dpi=110, bbox_inches="tight")
     plt.close(fig)
-    return stats
+
+
+def plot_downtime(downtime, start, fname):
+    """Plot the downtime realization as a date versus local-time raster with monthly uptime.
+
+    Parameters
+    ----------
+    downtime : numpy.ndarray
+        Merged downtime intervals (MJD).
+    start : str
+        Start date (UTC) of the year.
+    fname : Path
+        Output image filename.
+    """
+    start_mjd = survey_epoch(start)[0]
+    step = 1.0 / 96.0  # 15 minutes.
+    times = start_mjd + np.arange(0.0, YEAR_DAYS, step)
+    down = np.zeros(times.size, bool)
+    for begin, end in downtime:
+        down[(times >= begin) & (times < end)] = True
+    local = times + SO_LONGITUDE_DEG / 360.0
+    local_day = np.floor(local - np.floor(local[0])).astype(int)
+    raster = np.full((local_day.max() + 1, 96), np.nan)
+    raster[local_day, ((local % 1.0) * 96).astype(int)] = down
+    months = Time(times, format="mjd").ymdhms.month
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 3.8), gridspec_kw={"width_ratios": [2, 1]})
+    ax1.imshow(
+        raster.T,
+        origin="lower",
+        aspect="auto",
+        cmap="Greys",
+        extent=[0, raster.shape[0], 0, 24],
+        vmin=0,
+        vmax=1.5,
+    )
+    ax1.set_xlabel(f"Local day since {start}")
+    ax1.set_ylabel("Local mean solar time (h)")
+    ax1.set_title(f"Downtime (dark), uptime {1 - down.mean():.3f}")
+    ax2.bar(np.arange(1, 13), [1 - down[months == m].mean() for m in range(1, 13)])
+    ax2.set_xticks(np.arange(1, 13))
+    ax2.set_xlabel("Month")
+    ax2.set_ylabel("Uptime")
+    fig.tight_layout()
+    fig.savefig(fname, dpi=110, bbox_inches="tight")
+    plt.close(fig)
 
 
 def random_sources(n, rng, dec_range=(-60.0, 20.0)):
@@ -558,8 +676,8 @@ sidereal day of the idealized scan, accumulate per-pixel hit and mean-time maps 
 <code>simulate_lightcurves</code> path is used unchanged.</p>
 <h2>Model assumptions</h2>
 <ul>
-<li>Site 22&deg;57'31"S 67&deg;47'15"W; boresight elevation 40&deg;; azimuth triangle wave at 1&deg;/s with
-instantaneous turnarounds.</li>
+<li>Site 22&deg;57'31"S 67&deg;47'15"W; boresight elevation 40&deg;; azimuth triangle wave at 1&deg;/s.
+Each 120&nbsp;s sweep is followed by a 6&nbsp;s (5%) turnaround at the end of the range with no data.</li>
 <li>Each patch is crossed once while rising, in the east range (az 30&ndash;150&deg;), and once while
 setting, in the west range (az 210&ndash;330&deg;). SO switches daily between the two for each patch:
 the rising and setting crossings around one meridian transit share a <code>transit_day</code>, and
@@ -567,9 +685,15 @@ successive transit days use opposite crossings. Each range is simulated for a fu
 <code>from_time_maps</code> picks one crossing per day.</li>
 <li>Each pixel is therefore observed at most once per tube per day. Row time is the hit-weighted (circular)
 mean of that crossing.</li>
-<li>13 tubes, 1.25&deg; field of view, 1.75&deg; hex spacing with half the outer ring missing; generic
-filter labels (8 MF, 4 UHF, 1 LF) to be replaced by the real mapping.</li>
-<li>No refraction, precession, sun/moon avoidance, weather, or turnaround overhead.</li>
+<li>13 tubes, 1.25&deg; field of view, 1.75&deg; hex spacing with half the outer ring missing; 8 MF,
+4 UHF, 1 LF.</li>
+<li>Pointings are precessed (IAU 2006) from the mean equator and equinox of one epoch, mid-way through
+the year, to ICRS; over a multi-year survey this drifts by ~0.014&deg; per year. Refraction (~0.01&deg;
+at 40&deg; elevation), nutation and aberration (&lt;0.006&deg;) are ignored.</li>
+<li>Downtime: 65% uptime by default, of which 60% of the lost time is in ~week-long outages
+(5&ndash;9 days, three times more likely to start in June&ndash;September) and the rest in 1&ndash;6&nbsp;h
+interruptions starting between 08:00 and 20:00 local time. Visits overlapping downtime are dropped. The
+7-day ObsTable diagnostics above the yearly plots use no downtime. No sun/moon avoidance.</li>
 <li>The az 30&ndash;150&deg; / 210&ndash;330&deg; throws limit coverage to roughly Dec &minus;59&deg; to
 +21&deg; (plus tube offsets), narrower than the full 40&deg;-elevation ring (&minus;73&deg; to +27&deg;).</li>
 </ul>
@@ -640,20 +764,33 @@ def main():
             "time_s",
             side,
         )
-    sky = add(
-        "sky_stats",
-        "Sky coverage and days observed per year",
-        "Left: fraction of the full sky observed on each UTC day (any tube of the band); it alternates"
-        " because the alternating crossing shifts each pixel by its rising-to-setting offset."
-        " Middle: area-weighted distribution of days per year a pixel is observed (one transit per"
-        " sidereal day, alternating rising/setting). Right: the same for any band. Pixels seen on only"
-        " one crossing are observed every other day. The idealized model has no weather, sun/moon"
-        " avoidance or downtime, so these are upper limits.",
-        plot_sky_stats,
+    downtime = simulate_downtime(args.start, YEAR_DAYS, uptime=args.uptime, seed=args.seed)
+    add(
+        "downtime",
+        "Downtime realization",
+        f"One random year of downtime for {args.uptime:.0%} uptime: about week-long outages, preferentially"
+        " June&ndash;September, plus interruptions of a few hours starting during local daytime.",
+        plot_downtime,
+        downtime,
+        args.start,
+    )
+    print("Accumulating one year of visits...", flush=True)
+    area = np.asarray(time_maps["maps"].pixsizemap(broadcastable=False)).ravel() / (4.0 * np.pi)
+    ideal = year_coverage(time_maps, args.start, args.first_side, None, area)
+    footprint = {band: values["footprint"] for band, values in ideal.items()}
+    actual = year_coverage(time_maps, args.start, args.first_side, downtime, area, footprint)
+    add(
+        "year_coverage",
+        "One year of coverage with downtime",
+        "From left: fraction of the full sky observed on each UTC day (grey: no downtime); area-weighted"
+        " days per year each footprint pixel is observed (dotted: no downtime); area-weighted revisit"
+        " gaps between observed transit days (one sidereal day when nothing is lost; longer gaps come from"
+        " downtime and edge pixels seen on one crossing only); days observed per year, any band. Sun/moon"
+        " avoidance is not modeled.",
+        plot_year_coverage,
         time_maps,
-        table,
-        start_mjd,
-        args.days,
+        ideal,
+        actual,
     )
     add(
         "coverage",
@@ -687,6 +824,9 @@ def main():
         "Mode": "debug" if args.debug else "full",
         "Resolution (deg) / sample interval (s)": f"{time_maps['res_deg']} / {time_maps['dt_s']:.3f}",
         "First day scan side": SIDE_NAMES[args.first_side],
+        "Precession epoch (MJD) / uptime / downtime seed": (
+            f"{time_maps['epoch_mjd']:.1f} / {args.uptime} / {args.seed}"
+        ),
         "Tubes": ", ".join(map(str, time_maps["tubes"])),
         "Start / days": f"{args.start} / {args.days:g}",
         "ObsTable rows": f"{len(table):,}",
@@ -699,14 +839,22 @@ def main():
             f"{np.mean(observed.all(1)[observed.any(1)]):.3f}"
         ),
     }
-    for band, values in sky.items():
-        p10, p50, p90 = values["per_year"]
-        summary[f"{band}: daily sky fraction mean (min-max) / ever observed"] = (
-            f"{np.mean(values['daily']):.3f} ({min(values['daily']):.3f}-{max(values['daily']):.3f})"
-            f" / {values['ever']:.3f}"
+    for band in actual:
+        row = {}
+        for label, values in (("no downtime", ideal[band]), ("downtime", actual[band])):
+            seen, daily = values["footprint"], values["daily"]
+            p10, p50, p90 = weighted_percentile(values["days"][seen], area[seen], [10, 50, 90])
+            row[label] = f"{daily.mean():.3f} ({np.percentile(daily, 10):.3f}-{np.percentile(daily, 90):.3f})"
+            row[label + " days"] = f"{p10:.0f} / {p50:.0f} / {p90:.0f}"
+        summary[f"{band}: daily sky fraction mean (10-90%), no downtime / downtime"] = (
+            f"{row['no downtime']} / {row['downtime']}"
         )
-        summary[f"{band}: days per year observed, 10/50/90% of area / fraction every day"] = (
-            f"{p10:.0f} / {p50:.0f} / {p90:.0f} / {values['full']:.3f}"
+        summary[f"{band}: days per year observed (10/50/90% of area), no downtime / downtime"] = (
+            f"{row['no downtime days']} / {row['downtime days']}"
+        )
+        gaps = weighted_percentile(actual[band]["gaps"], actual[band]["gap_weights"], [50, 90, 99])
+        summary[f"{band}: revisit gap with downtime, median / 90% / 99% / max (days)"] = (
+            " / ".join(f"{g:.1f}" for g in gaps) + f" / {actual[band]['gaps'].max():.1f}"
         )
     for band, values in cadence.items():
         summary[f"{band}: median revisit (h) / visits per day / span (min) / exposure (s)"] = " / ".join(

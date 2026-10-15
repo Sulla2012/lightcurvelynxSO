@@ -19,8 +19,13 @@ from lightcurvelynx.obstable.simons_observatory_obstable import (  # noqa: E402
     boresight_azel,
     equatorial_to_horizon,
     horizon_to_equatorial,
+    merge_intervals,
+    overlaps_intervals,
     point_visits,
+    precession_matrix,
     read_time_maps,
+    rotate_radec,
+    simulate_downtime,
     simulate_time_maps,
     tube_offsets,
     write_time_maps,
@@ -54,29 +59,47 @@ def test_tube_layout():
 
 
 def test_boresight_schedule():
-    """The boresight scans the requested azimuth range at the scan speed."""
+    """The boresight sweeps each azimuth range at the scan speed, with 5% turnarounds at the ends."""
     t = np.arange(0.0, 4 * 3600.0, 0.5)
-    for side, (low, high) in enumerate(((30, 150), (210, 330))):
-        az, el = boresight_azel(
-            t, side, elevation_deg=40.0, az_ranges=((30, 150), (210, 330)), speed_deg_s=1.0
-        )
+    scan = {"elevation_deg": 40.0, "az_ranges": ((30, 150), (210, 330)), "speed_deg_s": 1.0}
+    for side, (low, high) in enumerate(scan["az_ranges"]):
+        az, el, valid = boresight_azel(t, side, turnaround_frac=0.05, **scan)
         assert np.all(el == 40.0)
         assert np.all((az >= low) & (az <= high)) and az.min() == low and az.max() == high
-        assert np.allclose(np.abs(np.diff(az)), 0.5)
+        assert np.mean(valid) == pytest.approx(1.0 / 1.05, abs=1e-3)
+        assert np.all(np.isin(az[~valid], [low, high]))
+        moving = valid[1:] & valid[:-1]
+        assert np.allclose(np.abs(np.diff(az))[moving], 0.5)
+        # Turnarounds last 6 s (12 samples) per 120 s sweep.
+        runs = np.diff(np.flatnonzero(np.diff(valid.astype(int)) != 0))
+        assert set(runs[::2]) | set(runs[1::2]) == {12, 240}
 
 
 def test_horizon_to_equatorial_matches_astropy():
-    """Our spherical-trig conversion agrees with astropy (refraction off) to < 0.05 deg."""
+    """With precession, our horizon -> ICRS conversion matches astropy (refraction off) to < 0.01 deg."""
     rng = np.random.default_rng(1)
     az, el = rng.uniform(0, 360, 50), rng.uniform(20, 80, 50)
     obstime = Time(61327.3 + rng.uniform(0, 1, 50), format="mjd")
     frame = AltAz(obstime=obstime, location=SO_SITE, pressure=0)
     icrs = SkyCoord(az=az * u.deg, alt=el * u.deg, frame=frame).icrs
-    lst = obstime.sidereal_time("apparent", longitude=SO_LONGITUDE_DEG).deg
-    ra, dec = horizon_to_equatorial(az, el, lst)
-    sep = SkyCoord(ra * u.deg, dec * u.deg).separation(icrs).deg
-    # Precession between J2000 and the epoch of date is ~0.36 deg in 2026.
-    assert np.max(sep) < 0.5
+    lst = obstime.sidereal_time("mean", longitude=SO_LONGITUDE_DEG).deg
+    ra_date, dec_date = horizon_to_equatorial(az, el, lst)
+    sep = SkyCoord(ra_date * u.deg, dec_date * u.deg).separation(icrs).deg
+    assert np.max(sep) > 0.3  # Precession since J2000 moves positions by up to ~0.37 deg in 2026.
+    ra, dec = rotate_radec(ra_date, dec_date, precession_matrix(61327.8).T)
+    # What remains is nutation and annual aberration (each < 0.006 deg).
+    assert np.max(SkyCoord(ra * u.deg, dec * u.deg).separation(icrs).deg) < 0.01
+
+
+def test_precession_round_trip():
+    """Precessing to the epoch of date and back returns the input, and J2000 is (almost) a no-op."""
+    rng = np.random.default_rng(2)
+    ra, dec = rng.uniform(0, 360, 100), rng.uniform(-80, 80, 100)
+    matrix = precession_matrix(61406.0)
+    ra2, dec2 = rotate_radec(*rotate_radec(ra, dec, matrix), matrix.T)
+    assert np.allclose(np.cos(np.radians(ra - ra2)), 1.0) and np.allclose(dec, dec2)
+    ra_j2000, dec_j2000 = rotate_radec(ra, dec, precession_matrix(51544.5))
+    assert np.allclose(dec_j2000, dec, atol=1e-4)
 
 
 def test_time_map_coverage(time_maps):
@@ -133,8 +156,8 @@ def test_table_pointing_matches_astropy(table):
     frame = AltAz(obstime=Time(rows["time"].to_numpy(), format="mjd"), location=SO_SITE, pressure=0)
     altaz = SkyCoord(rows["ra"].to_numpy() * u.deg, rows["dec"].to_numpy() * u.deg).transform_to(frame)
     offsets = tube_offsets()[rows["tube_id"].to_numpy()]
-    # Field of view radius + pixel half diagonal + precession slop.
-    assert np.all(np.abs(altaz.alt.deg - 40.0 - offsets[:, 1]) < 0.625 + np.sqrt(2) + 0.4)
+    # Field of view radius + pixel half diagonal + nutation/aberration slop.
+    assert np.all(np.abs(altaz.alt.deg - 40.0 - offsets[:, 1]) < 0.625 + np.sqrt(2) + 0.02)
     east = rows["side"].to_numpy() == "east"
     assert np.all((altaz.az.deg[east] > 20) & (altaz.az.deg[east] < 160))
     assert np.all((altaz.az.deg[~east] > 200) & (altaz.az.deg[~east] < 340))
@@ -202,7 +225,7 @@ def test_time_map_io(time_maps, tmp_path):
     loaded = read_time_maps(fname)
     assert np.allclose(loaded["maps"], time_maps["maps"], equal_nan=True)
     assert np.array_equal(loaded["tubes"], time_maps["tubes"])
-    for key in ("res_deg", "dt_s", "elevation_deg", "az_ranges"):
+    for key in ("res_deg", "dt_s", "epoch_mjd", "turnaround_frac", "elevation_deg", "az_ranges"):
         assert np.allclose(loaded[key], time_maps[key])
 
 
@@ -224,3 +247,40 @@ def test_simulate_lightcurves(time_maps, passbands_dir):
     assert len(lightcurve) == np.sum(table["pixel_index"] == row["pixel_index"]) >= 2
     assert np.all(lightcurve["pixel_index"] == row["pixel_index"])
     assert np.allclose(lightcurve["fluxerr"], 10.0 / np.sqrt(lightcurve["exposure_s"]))
+
+
+def test_intervals():
+    """Intervals merge, and spans overlapping them are flagged."""
+    merged = merge_intervals([[3, 4], [0, 1], [0.5, 2], [1.5, 1.8], [5, 6]])
+    assert np.array_equal(merged, [[0, 2], [3, 4], [5, 6]])
+    flags = overlaps_intervals(
+        np.array([2.1, 2.5, 3.9, -1.0, 6.0]), np.array([2.9, 3.1, 4.5, -0.5, 7.0]), merged
+    )
+    assert np.array_equal(flags, [False, True, True, False, False])
+
+
+def test_simulate_downtime():
+    """Downtime meets the uptime target, with week-long winter outages and daytime interruptions."""
+    downtime = simulate_downtime("2027-01-01", 365.25, seed=3)
+    lengths = np.diff(downtime, axis=1)[:, 0]
+    assert 1.0 - lengths.sum() / 365.25 == pytest.approx(0.65, abs=1e-6)
+    assert np.all(downtime[1:, 0] > downtime[:-1, 1])
+    long = lengths > 2.0
+    assert lengths[long].sum() / 365.25 == pytest.approx(0.35 * 0.6, abs=0.05)
+    winter = np.isin(Time(downtime[long, 0], format="mjd").ymdhms.month, (6, 7, 8, 9))
+    assert winter.mean() > 4 / 12
+    local_hour = ((downtime[~long, 0] + SO_LONGITUDE_DEG / 360.0) % 1.0) * 24.0
+    assert np.mean((local_hour >= 8.0) & (local_hour <= 20.0)) > 0.9
+
+
+def test_table_downtime(time_maps, table):
+    """Visits overlapping downtime are removed and all others are kept."""
+    start = Time(START).mjd
+    downtime = merge_intervals([[start + 0.5, start + 1.5], [start + 2.2, start + 2.3]])
+    reduced = SimonsObservatoryObsTable.from_time_maps(time_maps, START, 3, downtime=downtime)._table
+    df = table._table
+    hit = overlaps_intervals(df["time_start"].to_numpy(), df["time_end"].to_numpy(), downtime)
+    assert 0 < hit.sum() < len(df) and len(reduced) == np.sum(~hit)
+    assert not np.any(
+        overlaps_intervals(reduced["time_start"].to_numpy(), reduced["time_end"].to_numpy(), downtime)
+    )

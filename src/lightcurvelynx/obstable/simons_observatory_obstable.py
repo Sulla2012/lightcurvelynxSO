@@ -6,6 +6,8 @@ scanning in each azimuth range, accumulate per-pixel hit counts and mean observa
 each tube and range on a pixell CAR map, and materialize those maps into a standard ObsTable with
 one row per (tube, day, observed pixel). Because the scan is defined in local sidereal time (LST),
 it repeats every sidereal day, so the simulated day is replicated for the full date range.
+Pointings are precessed from the mean equator and equinox of a reference epoch to ICRS, and
+instrument downtime can be simulated and removed from the table.
 
 Idealized scan model
 --------------------
@@ -14,12 +16,16 @@ Idealized scan model
   setting, in the west range (az 210-330 deg), around each meridian transit. SO switches daily
   between the rising and the setting scan of a patch, so successive transits of a patch alternate
   between its rising and its setting crossing.
-* Azimuth follows a triangle wave at 1 deg/s with instantaneous turnarounds.
+* Azimuth follows a triangle wave at 1 deg/s. Each 120 s sweep is followed by a turnaround lasting
+  5% of a sweep, during which no data are taken.
+* Precession is computed once for the reference epoch (it moves the sky by ~0.014 deg per year);
+  refraction (~0.01 deg at 40 deg elevation), nutation and aberration (< 0.006 deg) are ignored.
 * 13 tubes of 1.25 deg diameter in a hex pattern (1.75 deg spacing, half the outer ring
   missing); 8 MF, 4 UHF, 1 LF. A pixel is hit whenever its center is inside a tube's FoV.
 * Each pixel is therefore observed at most once per tube per sidereal day.
 """
 
+import erfa
 import numpy as np
 import pandas as pd
 from astropy.time import Time
@@ -35,14 +41,16 @@ SO_LATITUDE_DEG = -(22.0 + 57.0 / 60.0 + 31.0 / 3600.0)
 SO_LONGITUDE_DEG = -(67.0 + 47.0 / 60.0 + 15.0 / 3600.0)
 SO_TUBE_FILTERS = ("MF",) * 8 + ("UHF",) * 4 + ("LF",)
 SIDEREAL_DAY_S = 86164.0905
+SO_DEFAULT_EPOCH_MJD = 61406.0  # 2027-01-01
 MAP_FIELDS = ("hits", "time_s", "start_s", "duration_s", "exposure_s", "n_passes")
 SIDE_NAMES = ("east", "west")
-_SCALAR_SCAN_KEYS = ("elevation_deg", "speed_deg_s", "fov_deg", "tube_spacing_deg")
-_HEADER_KEYS = ("res_deg", "dt_s", "lat_deg", *_SCALAR_SCAN_KEYS)
+_SCALAR_SCAN_KEYS = ("elevation_deg", "speed_deg_s", "turnaround_frac", "fov_deg", "tube_spacing_deg")
+_HEADER_KEYS = ("res_deg", "dt_s", "lat_deg", "epoch_mjd", *_SCALAR_SCAN_KEYS)
 SCAN_DEFAULTS = {
     "elevation_deg": 40.0,
     "az_ranges": ((30.0, 150.0), (210.0, 330.0)),
     "speed_deg_s": 1.0,
+    "turnaround_frac": 0.05,
     "fov_deg": 1.25,
     "tube_spacing_deg": 1.75,
 }
@@ -112,7 +120,7 @@ def angular_separation_deg(lon1, lat1, lon2, lat2):
     return np.degrees(2.0 * np.arcsin(np.sqrt(np.clip(h, 0.0, 1.0))))
 
 
-def scan_time_step(res_deg, speed_deg_s, az_ranges, dt_s=None, **_):
+def scan_time_step(res_deg, speed_deg_s, az_ranges, turnaround_frac, dt_s=None, **_):
     """Choose the sample interval so that one azimuth sweep is an integer number of samples.
 
     Parameters
@@ -123,6 +131,8 @@ def scan_time_step(res_deg, speed_deg_s, az_ranges, dt_s=None, **_):
         Azimuth scan speed in degrees per second.
     az_ranges : tuple
         Scan azimuth ranges; the first range sets the sweep duration.
+    turnaround_frac : float
+        Turnaround duration as a fraction of the sweep duration.
     dt_s : float, optional
         Requested (maximum) sample interval in seconds.
 
@@ -130,17 +140,19 @@ def scan_time_step(res_deg, speed_deg_s, az_ranges, dt_s=None, **_):
     -------
     dt_s : float
         Sample interval in seconds.
-    samples_per_sweep : int
-        Number of samples in one one-way azimuth sweep.
+    cycle_s : float
+        Duration of one sweep plus its turnaround in seconds.
     """
     sweep_s = (az_ranges[0][1] - az_ranges[0][0]) / speed_deg_s
     requested = res_deg / (2.0 * speed_deg_s) if dt_s is None else dt_s
-    samples_per_sweep = int(np.ceil(sweep_s / requested))
-    return sweep_s / samples_per_sweep, samples_per_sweep
+    return sweep_s / int(np.ceil(sweep_s / requested)), sweep_s * (1.0 + turnaround_frac)
 
 
-def boresight_azel(t_s, side, *, elevation_deg, az_ranges, speed_deg_s, **_):
+def boresight_azel(t_s, side, *, elevation_deg, az_ranges, speed_deg_s, turnaround_frac, **_):
     """Return the boresight azimuth and elevation while scanning one azimuth range.
+
+    Each constant-speed sweep is followed by a turnaround at the end of the range lasting
+    ``turnaround_frac`` of a sweep; samples taken during turnarounds are flagged as invalid.
 
     Parameters
     ----------
@@ -154,17 +166,61 @@ def boresight_azel(t_s, side, *, elevation_deg, az_ranges, speed_deg_s, **_):
         ((east_min, east_max), (west_min, west_max)) azimuth ranges in degrees.
     speed_deg_s : float
         Azimuth scan speed in degrees per second.
+    turnaround_frac : float
+        Turnaround duration as a fraction of the sweep duration.
 
     Returns
     -------
     az, el : numpy.ndarray
-        Boresight azimuth and elevation in degrees.
+        Boresight azimuth and elevation in degrees (held at the range end during turnarounds).
+    valid : numpy.ndarray
+        True for samples taken during a sweep (not a turnaround).
     """
     low, high = az_ranges[side]
     throw_s = (high - low) / speed_deg_s
-    phase = t_s % (2.0 * throw_s)
-    az = low + speed_deg_s * np.where(phase < throw_s, phase, 2.0 * throw_s - phase)
-    return az, np.full_like(az, elevation_deg)
+    cycle_s = throw_s * (1.0 + turnaround_frac)
+    phase = t_s % cycle_s
+    forward = (t_s // cycle_s) % 2 == 0
+    travel = speed_deg_s * np.minimum(phase, throw_s)
+    az = np.where(forward, low + travel, high - travel)
+    return az, np.full_like(az, elevation_deg), phase < throw_s
+
+
+def precession_matrix(epoch_mjd):
+    """Return the IAU 2006 bias-precession matrix from ICRS to the mean equator and equinox of date.
+
+    Parameters
+    ----------
+    epoch_mjd : float
+        Epoch (MJD, TT; the UTC-TT difference is negligible here).
+
+    Returns
+    -------
+    numpy.ndarray
+        3x3 rotation matrix R with v_date = R @ v_icrs.
+    """
+    return erfa.pmat06(2400000.5, epoch_mjd)
+
+
+def rotate_radec(ra_deg, dec_deg, matrix):
+    """Apply a rotation matrix to equatorial coordinates.
+
+    Parameters
+    ----------
+    ra_deg, dec_deg : numpy.ndarray
+        Right ascension and declination in degrees.
+    matrix : numpy.ndarray
+        3x3 rotation matrix.
+
+    Returns
+    -------
+    ra, dec : numpy.ndarray
+        Rotated right ascension in [0, 360) and declination in degrees.
+    """
+    ra, dec = np.radians(ra_deg), np.radians(dec_deg)
+    vec = np.stack((np.cos(dec) * np.cos(ra), np.cos(dec) * np.sin(ra), np.sin(dec)), axis=-1) @ matrix.T
+    ra_out = np.degrees(np.arctan2(vec[..., 1], vec[..., 0])) % 360.0
+    return ra_out, np.degrees(np.arcsin(np.clip(vec[..., 2], -1.0, 1.0)))
 
 
 def horizon_to_equatorial(az_deg, el_deg, lst_deg, lat_deg=SO_LATITUDE_DEG):
@@ -247,6 +303,7 @@ def simulate_time_maps(
     dec_range=(-70.0, 30.0),
     dt_s=None,
     lat_deg=SO_LATITUDE_DEG,
+    epoch_mjd=SO_DEFAULT_EPOCH_MJD,
     max_points=4_000_000,
     **scan_kwargs,
 ):
@@ -271,6 +328,9 @@ def simulate_time_maps(
         each azimuth sweep holds an integer number of samples.
     lat_deg : float
         Site latitude in degrees.
+    epoch_mjd : float
+        Epoch (MJD) whose mean equator and equinox define LST; pointings are precessed to ICRS.
+        Use a date near the middle of the survey.
     max_points : int
         Maximum number of (time, tube, pixel) candidates processed per chunk (memory control).
     **scan_kwargs
@@ -285,13 +345,15 @@ def simulate_time_maps(
         the first in-FoV time (``start_s``), the visit length from first to last in-FoV sample
         (``duration_s``), the total time inside the FoV (``exposure_s``) and the number of azimuth
         sweeps that pass over the pixel (``n_passes``). Times are seconds since LST = 0; unobserved
-        pixels are NaN.
-        Also contains ``tubes``, ``res_deg``, ``dt_s``, ``lat_deg`` and the scan parameters.
+        pixels are NaN. Map coordinates are ICRS.
+        Also contains ``tubes``, ``res_deg``, ``dt_s``, ``lat_deg``, ``epoch_mjd`` and the scan
+        parameters.
     """
     _require_pixell()
     scan = {**SCAN_DEFAULTS, **scan_kwargs}
     tubes = np.arange(13) if tubes is None else np.atleast_1d(tubes).astype(int)
-    dt_s, per_sweep = scan_time_step(res_deg, dt_s=dt_s, **scan)
+    dt_s, cycle_s = scan_time_step(res_deg, dt_s=dt_s, **scan)
+    to_icrs = precession_matrix(epoch_mjd).T
     shape, wcs = enmap.band_geometry(np.radians(dec_range), res=np.radians(res_deg))
     ny, nx = shape
     dec_pix, ra_pix = np.degrees(enmap.posmap(shape, wcs))
@@ -310,14 +372,17 @@ def simulate_time_maps(
     t_min, t_min_shift = np.full(nbins, np.inf), np.full(nbins, np.inf)
     t_max, t_max_shift = np.full(nbins, -np.inf), np.full(nbins, -np.inf)
     n_samples = int(np.ceil(SIDEREAL_DAY_S / dt_s))
-    n_sweeps = n_samples // per_sweep + 1
-    chunk = max(1, max_points // (len(tubes) * len(dy) * per_sweep)) * per_sweep  # whole sweeps
-    for side, start in ((s, i) for s in range(2) for i in range(0, n_samples, chunk)):
-        k = np.arange(start, min(start + chunk, n_samples))
+    n_sweeps = int(SIDEREAL_DAY_S // cycle_s) + 1
+    chunk = max(1, int(max_points * dt_s / (len(tubes) * len(dy) * cycle_s))) * cycle_s  # whole sweeps
+    edges = np.append(np.ceil(np.arange(0.0, SIDEREAL_DAY_S, chunk) / dt_s), n_samples).astype(int)
+    for side, (k0, k1) in ((s, e) for s in range(2) for e in zip(edges[:-1], edges[1:], strict=True)):
+        k = np.arange(k0, k1)
         t = k * dt_s
-        az, el = boresight_azel(t, side, **scan)
+        az, el, valid = boresight_azel(t, side, **scan)
+        k, t, az, el = k[valid], t[valid], az[valid], el[valid]
         tube_az, tube_el = tube_pointing(az, el, centers)
-        ra_c, dec_c = horizon_to_equatorial(tube_az, tube_el, (360.0 * t / SIDEREAL_DAY_S)[:, None], lat_deg)
+        lst = (360.0 * t / SIDEREAL_DAY_S)[:, None]
+        ra_c, dec_c = rotate_radec(*horizon_to_equatorial(tube_az, tube_el, lst, lat_deg), to_icrs)
         center_pix = sky_to_pixel(shape, wcs, ra_c, dec_c).reshape(ra_c.shape)[..., None]
         y = center_pix // nx + dy
         x = (center_pix % nx + dx) % nx
@@ -338,7 +403,7 @@ def simulate_time_maps(
         np.maximum.at(t_max, bins, tt)
         np.minimum.at(t_min_shift, bins, shifted)
         np.maximum.at(t_max_shift, bins, shifted)
-        sweeps = np.unique(bins.astype(np.int64) * n_sweeps + k[it] // per_sweep)
+        sweeps = np.unique(bins.astype(np.int64) * n_sweeps + (tt // cycle_s).astype(np.int64))
         passes += np.bincount(sweeps // n_sweeps, minlength=nbins)
 
     hits, cos_sum, sin_sum, passes, t_min, t_max, t_min_shift, t_max_shift = (
@@ -366,6 +431,7 @@ def simulate_time_maps(
         "res_deg": float(res_deg),
         "dt_s": float(dt_s),
         "lat_deg": float(lat_deg),
+        "epoch_mjd": float(epoch_mjd),
         **scan,
     }
 
@@ -397,7 +463,16 @@ def equatorial_to_horizon(ra_deg, dec_deg, lst_deg, lat_deg=SO_LATITUDE_DEG):
 
 
 def point_visits(
-    ra, dec, tube_id, *, res_deg=0.5, dt_s=None, lat_deg=SO_LATITUDE_DEG, max_gap_s=1800.0, **scan_kwargs
+    ra,
+    dec,
+    tube_id,
+    *,
+    res_deg=0.5,
+    dt_s=None,
+    lat_deg=SO_LATITUDE_DEG,
+    epoch_mjd=SO_DEFAULT_EPOCH_MJD,
+    max_gap_s=1800.0,
+    **scan_kwargs,
 ):
     """Trace when one sky position is inside a tube's field of view over one day of each scan side.
 
@@ -408,13 +483,15 @@ def point_visits(
     Parameters
     ----------
     ra, dec : float
-        Source position in degrees.
+        Source position (ICRS) in degrees.
     tube_id : int
         Optics-tube index.
     res_deg, dt_s : float, optional
         Used to choose the sample interval as in ``simulate_time_maps``.
     lat_deg : float
         Site latitude in degrees.
+    epoch_mjd : float
+        Epoch (MJD) of the mean equator and equinox used for LST.
     max_gap_s : float
         In-FoV samples separated by more than this (seconds) belong to different visits.
     **scan_kwargs
@@ -427,17 +504,17 @@ def point_visits(
         ``duration_s``, ``exposure_s`` and ``n_passes``; times in seconds since LST = 0.
     """
     scan = {key: scan_kwargs.get(key, value) for key, value in SCAN_DEFAULTS.items()}
-    dt_s, per_sweep = scan_time_step(res_deg, dt_s=dt_s, **scan)
+    dt_s, cycle_s = scan_time_step(res_deg, dt_s=dt_s, **scan)
     k = np.arange(int(np.ceil(SIDEREAL_DAY_S / dt_s)))
     t = k * dt_s
-    src_az, src_el = equatorial_to_horizon(ra, dec, 360.0 * t / SIDEREAL_DAY_S, lat_deg)
+    ra_date, dec_date = rotate_radec(ra, dec, precession_matrix(epoch_mjd))
+    src_az, src_el = equatorial_to_horizon(ra_date, dec_date, 360.0 * t / SIDEREAL_DAY_S, lat_deg)
     visits = []
     for side in range(2):
-        az, el = boresight_azel(t, side, **scan)
+        az, el, valid = boresight_azel(t, side, **scan)
         tube_az, tube_el = tube_pointing(az, el, tube_offsets(scan["tube_spacing_deg"])[[tube_id]])
-        inside = np.flatnonzero(
-            angular_separation_deg(tube_az[:, 0], tube_el[:, 0], src_az, src_el) <= 0.5 * scan["fov_deg"]
-        )
+        separation = angular_separation_deg(tube_az[:, 0], tube_el[:, 0], src_az, src_el)
+        inside = np.flatnonzero(valid & (separation <= 0.5 * scan["fov_deg"]))
         if len(inside) == 0:
             continue
         groups = np.split(inside, np.flatnonzero(np.diff(t[inside]) > max_gap_s) + 1)
@@ -455,7 +532,7 @@ def point_visits(
                     "start_s": times[0] % SIDEREAL_DAY_S,
                     "duration_s": times[-1] - times[0] + dt_s,
                     "exposure_s": len(g) * dt_s,
-                    "n_passes": len(np.unique(k[g] // per_sweep)),
+                    "n_passes": len(np.unique(t[g] // cycle_s)),
                 }
             )
     return visits
@@ -507,6 +584,195 @@ def read_time_maps(fname):
     return result
 
 
+def survey_epoch(start_date):
+    """Return the start MJD and the MJD of the preceding LST = 0 at the SO site.
+
+    Parameters
+    ----------
+    start_date : str or float
+        ISO date string (UTC) or MJD.
+
+    Returns
+    -------
+    start_mjd, lst0_mjd : float
+        Start time and the time of the last LST = 0 at or before it (MJD).
+    """
+    is_mjd = isinstance(start_date, int | float | np.number)
+    start = Time(start_date, format="mjd" if is_mjd else None, scale="utc")
+    lst_start = start.sidereal_time("mean", longitude=SO_LONGITUDE_DEG).deg
+    return start.mjd, start.mjd - lst_start / 360.0 * SIDEREAL_DAY_S / 86400.0
+
+
+def merge_intervals(intervals):
+    """Merge overlapping [start, end) intervals.
+
+    Parameters
+    ----------
+    intervals : array-like
+        Intervals of shape (N, 2).
+
+    Returns
+    -------
+    numpy.ndarray
+        Sorted, disjoint intervals of shape (M, 2).
+    """
+    intervals = np.asarray(intervals, dtype=float).reshape(-1, 2)
+    intervals = intervals[np.argsort(intervals[:, 0])]
+    if len(intervals) == 0:
+        return intervals
+    # A new group starts where an interval begins after every earlier interval has ended.
+    ends = np.maximum.accumulate(intervals[:, 1])
+    starts = np.flatnonzero(np.r_[True, intervals[1:, 0] > ends[:-1]])
+    return np.column_stack((intervals[starts, 0], np.maximum.reduceat(intervals[:, 1], starts)))
+
+
+def overlaps_intervals(t_start, t_end, intervals):
+    """Return whether each [t_start, t_end] span overlaps any of the merged intervals.
+
+    Parameters
+    ----------
+    t_start, t_end : numpy.ndarray
+        Span boundaries.
+    intervals : numpy.ndarray
+        Sorted, disjoint intervals of shape (M, 2) (see ``merge_intervals``).
+
+    Returns
+    -------
+    numpy.ndarray
+        Boolean overlap flag per span.
+    """
+    if len(intervals) == 0:
+        return np.zeros(np.shape(t_start), dtype=bool)
+    # Only the last interval starting before t_end can overlap, because the intervals are disjoint.
+    idx = np.searchsorted(intervals[:, 0], t_end, side="left") - 1
+    return (idx >= 0) & (intervals[np.maximum(idx, 0), 1] > t_start)
+
+
+def simulate_downtime(
+    start_date,
+    n_days,
+    *,
+    uptime=0.65,
+    chunk_fraction=0.6,
+    chunk_days=(5.0, 9.0),
+    chunk_months=(6, 7, 8, 9),
+    chunk_season_weight=3.0,
+    gap_hours=(1.0, 6.0),
+    gap_local_hours=(8.0, 20.0),
+    seed=None,
+):
+    """Draw random instrument downtime intervals.
+
+    Downtime has two parts: long outages of about a week, preferentially in the austral winter
+    (June-September), and scattered interruptions of a few hours that start during local daytime.
+    Outages are added until they cover ``chunk_fraction`` of the downtime budget, then
+    interruptions until the total downtime reaches ``(1 - uptime) * n_days``.
+
+    Parameters
+    ----------
+    start_date : str or float
+        Survey start as an ISO date string (UTC) or MJD.
+    n_days : float
+        Survey length in days.
+    uptime : float
+        Fraction of the time the instrument is observing.
+    chunk_fraction : float
+        Fraction of the downtime in long outages.
+    chunk_days : tuple
+        (min, max) outage length in days (uniform).
+    chunk_months : tuple
+        Months in which outages are preferentially placed.
+    chunk_season_weight : float
+        Relative rate of outage starts in ``chunk_months``.
+    gap_hours : tuple
+        (min, max) interruption length in hours (uniform).
+    gap_local_hours : tuple
+        (min, max) local mean solar time (hours) at which interruptions start (uniform).
+    seed : int, optional
+        Random seed.
+
+    Returns
+    -------
+    numpy.ndarray
+        Sorted, disjoint downtime intervals (MJD) of shape (M, 2) within the survey.
+    """
+    rng = np.random.default_rng(seed)
+    start_mjd, _ = survey_epoch(start_date)
+    end_mjd = start_mjd + n_days
+    days = start_mjd + np.arange(int(np.ceil(n_days)))
+    months = Time(days, format="mjd").ymdhms.month
+    weights = np.where(np.isin(months, chunk_months), chunk_season_weight, 1.0)
+    utc_minus_local = -SO_LONGITUDE_DEG / 360.0  # Local mean solar time = UTC + longitude / 15 h.
+
+    intervals = np.empty((0, 2))
+    total = lambda: np.sum(np.diff(intervals, axis=1))  # noqa: E731
+    budgets = ((1.0 - uptime) * n_days * chunk_fraction, (1.0 - uptime) * n_days)
+    for kind, budget in enumerate(budgets):
+        while total() < budget - 1e-9:
+            if kind == 0:
+                begin = rng.choice(days, p=weights / weights.sum()) + rng.uniform(0.0, 1.0)
+                length = rng.uniform(*chunk_days)
+            else:
+                begin = np.floor(rng.choice(days)) + rng.uniform(*gap_local_hours) / 24.0 + utc_minus_local
+                length = rng.uniform(*gap_hours) / 24.0
+            length = min(length, budget - total())
+            new = np.clip([[begin, begin + length]], start_mjd, end_mjd)
+            intervals = merge_intervals(np.vstack((intervals, new)))
+    return intervals
+
+
+def visit_schedule(time_maps, tube, side, start_date, n_days, *, first_side=0, downtime=None):
+    """Return the visits of one tube on one scan side over a date range.
+
+    Successive meridian transits of each pixel alternate between its rising (east) and setting
+    (west) crossing; this returns the visits on the transit days assigned to ``side``.
+
+    Parameters
+    ----------
+    time_maps : dict
+        Output of ``simulate_time_maps`` or ``read_time_maps``.
+    tube : int
+        Tube index (must be in ``time_maps``).
+    side : int
+        Scan side (0 = east/rising, 1 = west/setting).
+    start_date : str or float
+        Survey start as an ISO date string (UTC) or MJD.
+    n_days : float
+        Survey length in days; visits outside [start, start + n_days) are dropped.
+    first_side : int
+        Scan side for transits on the sidereal day (from LST = 0) containing the start.
+    downtime : numpy.ndarray, optional
+        Merged downtime intervals (MJD); visits overlapping them are dropped.
+
+    Returns
+    -------
+    dict
+        Arrays ``pixel`` (flat map index), ``transit_day``, ``time``, ``time_start`` and
+        ``time_end`` (MJD), one entry per visit.
+    """
+    maps = time_maps["maps"]
+    start_mjd, lst0_mjd = survey_epoch(start_date)
+    sub = maps[:, list(time_maps["tubes"]).index(tube), side].reshape(len(MAP_FIELDS), -1)
+    fields = dict(zip(MAP_FIELDS, sub, strict=True))
+    pixels = np.flatnonzero(fields["hits"] > 0)
+    ra = np.degrees(np.asarray(maps.posmap())[1]).ravel()[pixels]
+    days = np.arange(-1, int(np.ceil(n_days * 86400.0 / SIDEREAL_DAY_S)) + 2)
+    time_s = days[:, None] * SIDEREAL_DAY_S + fields["time_s"][pixels][None, :]
+    day = transit_day(time_s, ra)
+    mjd = lst0_mjd + time_s / 86400.0
+    keep = (mjd >= start_mjd) & (mjd < start_mjd + n_days) & ((day + first_side) % 2 == side)
+    pix = np.broadcast_to(pixels, mjd.shape)[keep]
+    # Start relative to the mean time, wrapped so visits spanning LST = 0 stay contiguous.
+    offset_s = (fields["start_s"][pix] - fields["time_s"][pix] + 0.5 * SIDEREAL_DAY_S) % SIDEREAL_DAY_S
+    visits = {"pixel": pix, "transit_day": day[keep], "time": mjd[keep]}
+    visits["time_start"] = visits["time"] + (offset_s - 0.5 * SIDEREAL_DAY_S) / 86400.0
+    visits["time_end"] = visits["time_start"] + fields["duration_s"][pix] / 86400.0
+    if downtime is not None:
+        up = ~overlaps_intervals(visits["time_start"], visits["time_end"], downtime)
+        visits = {key: value[up] for key, value in visits.items()}
+    return visits
+
+
 class SimonsObservatoryObsTable(ObsTable):
     """An ObsTable of Simons Observatory map-pixel observations for one or more optics tubes.
 
@@ -549,7 +815,16 @@ class SimonsObservatoryObsTable(ObsTable):
 
     @classmethod
     def from_time_maps(
-        cls, time_maps, start_date, n_days, *, tubes=None, filter_names=None, first_side=0, **kwargs
+        cls,
+        time_maps,
+        start_date,
+        n_days,
+        *,
+        tubes=None,
+        filter_names=None,
+        first_side=0,
+        downtime=None,
+        **kwargs,
     ):
         """Materialize simulated time maps into an ObsTable over a date range.
 
@@ -571,6 +846,9 @@ class SimonsObservatoryObsTable(ObsTable):
         first_side : int
             Scan side (0 = east/rising, 1 = west/setting) for transits on the sidereal day (from
             LST = 0) containing the start; the sides alternate on later days.
+        downtime : numpy.ndarray, optional
+            Downtime intervals (MJD), e.g. from ``simulate_downtime``; visits overlapping them
+            are dropped.
         **kwargs
             Additional survey values passed to the constructor.
 
@@ -583,41 +861,24 @@ class SimonsObservatoryObsTable(ObsTable):
         filter_names = SO_TUBE_FILTERS if filter_names is None else filter_names
         maps, map_tubes = time_maps["maps"], list(time_maps["tubes"])
         tubes = map_tubes if tubes is None else np.atleast_1d(tubes)
-        is_mjd = isinstance(start_date, int | float | np.number)
-        start = Time(start_date, format="mjd" if is_mjd else None, scale="utc")
-        start_mjd = start.mjd
-        lst_start = start.sidereal_time("mean", longitude=SO_LONGITUDE_DEG).deg
-        lst0_mjd = start_mjd - lst_start / 360.0 * SIDEREAL_DAY_S / 86400.0
-        days = np.arange(-1, int(np.ceil(n_days * 86400.0 / SIDEREAL_DAY_S)) + 2)
-        ra_pix = np.degrees(np.asarray(maps.posmap())[1]).ravel()
 
         pieces = []
         for tube, side in ((tube, side) for tube in tubes for side in range(2)):
-            sub = maps[:, map_tubes.index(tube), side].reshape(len(MAP_FIELDS), -1)
-            fields = dict(zip(MAP_FIELDS, sub, strict=True))
-            pixels = np.flatnonzero(fields["hits"] > 0)
-            time_s = days[:, None] * SIDEREAL_DAY_S + fields["time_s"][pixels][None, :]
-            day = transit_day(time_s, ra_pix[pixels])
-            mjd = lst0_mjd + time_s / 86400.0
-            keep = (mjd >= start_mjd) & (mjd < start_mjd + n_days) & ((day + first_side) % 2 == side)
-            pix = np.broadcast_to(pixels, mjd.shape)[keep]
-            # Start relative to the mean time, wrapped so visits spanning LST = 0 stay contiguous.
-            start_offset_s = (
-                fields["start_s"][pix] - fields["time_s"][pix] + 0.5 * SIDEREAL_DAY_S
-            ) % SIDEREAL_DAY_S
-            time_start = mjd[keep] + (start_offset_s - 0.5 * SIDEREAL_DAY_S) / 86400.0
+            visits = visit_schedule(
+                time_maps, tube, side, start_date, n_days, first_side=first_side, downtime=downtime
+            )
+            pix = visits["pixel"]
+            fields = maps[:, map_tubes.index(tube), side].reshape(len(MAP_FIELDS), -1)
             pieces.append(
                 pd.DataFrame(
                     {
-                        "time": mjd[keep],
-                        "time_start": time_start,
-                        "time_end": time_start + fields["duration_s"][pix] / 86400.0,
+                        **{key: visits[key] for key in ("time", "time_start", "time_end")},
                         "filter": pd.Categorical.from_codes(np.zeros(len(pix), int), [filter_names[tube]]),
                         "tube_id": np.full(len(pix), tube, dtype=np.int16),
                         "side": pd.Categorical.from_codes(np.full(len(pix), side), SIDE_NAMES),
-                        "transit_day": day[keep].astype(np.int16),
+                        "transit_day": visits["transit_day"].astype(np.int16),
                         **{
-                            name: fields[name][pix].astype(np.float32)
+                            name: fields[MAP_FIELDS.index(name)][pix].astype(np.float32)
                             for name in ("hits", "duration_s", "exposure_s", "n_passes")
                         },
                         "pixel_index": pix.astype(np.int32),
