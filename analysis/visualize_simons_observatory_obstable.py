@@ -15,6 +15,7 @@ Time maps are cached as FITS files in ``--outdir`` and reused unless ``--overwri
 
 import argparse
 import html
+import textwrap
 from pathlib import Path
 
 import matplotlib
@@ -46,7 +47,9 @@ YEAR_DAYS = 365.25
 
 # Field -> (colorbar label, colormap, scale factor applied before plotting).
 FIELD_LABELS = {
+    "hits": ("Detector-array samples in FoV per visit", "inferno", 1.0),
     "time_s": ("LST of observation (h)", "twilight", 24.0 / SIDEREAL_DAY_S),
+    "start_s": ("LST of first in-FoV sample (h)", "twilight", 24.0 / SIDEREAL_DAY_S),
     "duration_s": ("Visit duration, first to last in-FoV sample (min)", "viridis", 1.0 / 60.0),
     "exposure_s": ("Time in tube FoV per visit (s)", "magma", 1.0),
     "n_passes": ("Azimuth sweeps over pixel per visit", "cividis", 1.0),
@@ -77,6 +80,7 @@ def parse_args():
     parser.add_argument(
         "--epoch", type=float, help="Precession epoch (MJD); default is mid-way through the year."
     )
+    parser.add_argument("--n-single", type=int, default=3, help="Tubes to plot individually.")
     parser.add_argument("--outdir", type=Path, default=Path("analysis/so_report"), help="Report directory.")
     parser.add_argument("--overwrite", action="store_true", help="Re-simulate even if cached maps exist.")
     parser.add_argument("--debug", action="store_true", help="Quick run: 2 deg pixels, tubes 0 1 12, 3 days.")
@@ -98,18 +102,20 @@ def load_or_simulate(args):
 
     Returns
     -------
-    dict
+    time_maps : dict
         Time maps as returned by ``simulate_time_maps``.
+    fname : Path
+        FITS file holding every map field for all tubes and both sides.
     """
     tag = f"res{args.res:g}_ep{args.epoch:.0f}_tubes{'-'.join(map(str, args.tubes))}"
     fname = args.outdir / f"time_maps_{tag}.fits"
     if fname.exists() and not args.overwrite:
         print(f"Reading cached time maps from {fname}")
-        return read_time_maps(fname)
+        return read_time_maps(fname), fname
     print(f"Simulating one sidereal day for tubes {args.tubes} at {args.res} deg...", flush=True)
     time_maps = simulate_time_maps(args.res, tubes=args.tubes, epoch_mjd=args.epoch)
     write_time_maps(fname, time_maps)
-    return time_maps
+    return time_maps, fname
 
 
 def sky_imshow(ax, image, maps, **kwargs):
@@ -170,6 +176,33 @@ def plot_tube_grid(time_maps, field, side, fname):
     for ax in axes.flat[len(tubes) :]:
         ax.set_visible(False)
     fig.colorbar(artist, ax=axes, label=label, shrink=0.8)
+    fig.savefig(fname, dpi=110, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_single_map(time_maps, tube, side, fname):
+    """Plot every map field for one tube and one scan side, one panel per field.
+
+    Parameters
+    ----------
+    time_maps : dict
+        Output of ``simulate_time_maps``.
+    tube : int
+        Tube index (as listed in ``time_maps["tubes"]``).
+    side : int
+        Scan side (0 = east/rising, 1 = west/setting).
+    fname : Path
+        Output image filename.
+    """
+    maps = time_maps["maps"][:, list(time_maps["tubes"]).index(tube), side]
+    fig, axes = plt.subplots(3, 2, figsize=(12, 10), squeeze=False)
+    for ax, field in zip(axes.flat, MAP_FIELDS, strict=True):
+        label, cmap, scale = FIELD_LABELS[field]
+        data = np.where(maps[0] > 0, maps[MAP_FIELDS.index(field)] * scale, np.nan)
+        artist = sky_imshow(ax, data, maps, cmap=cmap)
+        fig.colorbar(artist, ax=ax, label=textwrap.fill(label, 28), shrink=0.8)
+        ax.set_title(field, fontsize=10)
+    fig.suptitle(f"Tube {tube} ({SO_TUBE_FILTERS[tube]}), {('rising', 'setting')[side]} crossing")
     fig.savefig(fname, dpi=110, bbox_inches="tight")
     plt.close(fig)
 
@@ -707,7 +740,7 @@ def main():
     """Simulate (or load) time maps, build the ObsTable, and write the report."""
     args = parse_args()
     args.outdir.mkdir(parents=True, exist_ok=True)
-    time_maps = load_or_simulate(args)
+    time_maps, time_maps_file = load_or_simulate(args)
     start_mjd = Time(args.start, scale="utc").mjd
     table = SimonsObservatoryObsTable.from_time_maps(
         time_maps, args.start, args.days, first_side=args.first_side
@@ -745,25 +778,38 @@ def main():
         plot_validation,
         time_maps,
     )
-    for field, title in (
-        ("duration_s", "Visit duration"),
-        ("exposure_s", "Exposure"),
-        ("n_passes", "Passes"),
-    ):
-        caption = FIELD_LABELS[field][0] + ", rising crossing (setting is the mirror image)."
-        add(field, f"{title} maps", caption, plot_tube_grid, time_maps, field, 0)
-    for side, name in enumerate(SIDE_NAMES):
-        crossing = ("rising", "setting")[side]
-        caption = f"Mean LST of each pixel's visit on {crossing} days ({name} azimuth range)."
-        add(
-            f"time_s_{name}",
-            f"Observation-time maps: {crossing}",
-            caption,
-            plot_tube_grid,
-            time_maps,
-            "time_s",
-            side,
-        )
+    titles = {
+        "hits": "Hits",
+        "time_s": "Mean observation time",
+        "start_s": "Visit start time",
+        "duration_s": "Visit duration",
+        "exposure_s": "Exposure",
+        "n_passes": "Passes",
+    }
+    for field in MAP_FIELDS:
+        for side, name in enumerate(SIDE_NAMES):
+            crossing = ("rising", "setting")[side]
+            caption = f"{FIELD_LABELS[field][0]}, {crossing} crossing ({name} azimuth range); input time map."
+            add(
+                f"{field}_{name}",
+                f"Input time map, {titles[field].lower()}: {crossing}",
+                caption,
+                plot_tube_grid,
+                time_maps,
+                field,
+                side,
+            )
+    for tube in time_maps["tubes"][: args.n_single]:
+        for side, name in enumerate(SIDE_NAMES):
+            add(
+                f"single_tube{tube}_{name}",
+                f"Single time map: tube {tube} ({SO_TUBE_FILTERS[tube]}), {('rising', 'setting')[side]}",
+                "All six map fields for this one tube and crossing; pixels never observed are blank.",
+                plot_single_map,
+                time_maps,
+                tube,
+                side,
+            )
     downtime = simulate_downtime(args.start, YEAR_DAYS, uptime=args.uptime, seed=args.seed)
     add(
         "downtime",
@@ -827,6 +873,7 @@ def main():
         "Precession epoch (MJD) / uptime / downtime seed": (
             f"{time_maps['epoch_mjd']:.1f} / {args.uptime} / {args.seed}"
         ),
+        "Input time maps (FITS, all fields)": str(time_maps_file),
         "Tubes": ", ".join(map(str, time_maps["tubes"])),
         "Start / days": f"{args.start} / {args.days:g}",
         "ObsTable rows": f"{len(table):,}",
