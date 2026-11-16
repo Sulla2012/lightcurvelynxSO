@@ -1,7 +1,8 @@
 import astropy.units as u
 import numpy as np
+import pandas as pd
 import pytest
-from astropy.coordinates import AltAz, EarthLocation, SkyCoord
+from astropy.coordinates import AltAz, EarthLocation, SkyCoord, get_body
 from astropy.time import Time
 
 pytest.importorskip("pixell")
@@ -13,12 +14,18 @@ from lightcurvelynx.obstable.simons_observatory_obstable import (  # noqa: E402
     MAP_FIELDS,
     SIDE_NAMES,
     SIDEREAL_DAY_S,
+    SO_DAILY_DEPTH_MJY,
     SO_LATITUDE_DEG,
+    SO_LF_TOPHATS,
     SO_LONGITUDE_DEG,
     SimonsObservatoryObsTable,
+    add_bandflux_error,
     boresight_azel,
+    conserve_exposure,
+    daily_reference_exposure,
     equatorial_to_horizon,
     horizon_to_equatorial,
+    main_lobe,
     merge_intervals,
     overlaps_intervals,
     point_visits,
@@ -27,6 +34,9 @@ from lightcurvelynx.obstable.simons_observatory_obstable import (  # noqa: E402
     rotate_radec,
     simulate_downtime,
     simulate_time_maps,
+    so_passbands,
+    sun_moon_cut,
+    tophat_passbands,
     tube_offsets,
     write_time_maps,
 )
@@ -39,7 +49,7 @@ SO_SITE = EarthLocation(lat=SO_LATITUDE_DEG * u.deg, lon=SO_LONGITUDE_DEG * u.de
 
 @pytest.fixture(scope="module")
 def time_maps():
-    """Coarse time maps for two tubes (center and an outer UHF tube)."""
+    """Coarse time maps for two tubes (central UHF tube c1 and outer MF tube o3)."""
     return simulate_time_maps(2.0, tubes=[0, 9])
 
 
@@ -174,13 +184,13 @@ def test_table_alternates_rising_and_setting(time_maps, table):
     # Where a tube sees both crossings, revisits are one sidereal day plus or minus the
     # rising-to-setting offset (< 12 h); same-side revisits are exactly two sidereal days.
     sidereal_day = SIDEREAL_DAY_S / 86400.0
-    for _, group in df.groupby(["tube_id", "pixel_index"]):
+    for _, group in df.groupby(["tube_id", "filter", "pixel_index"], observed=True):
         sides = group["side"].to_numpy()
         if len(set(sides)) < 2:
             continue
         assert np.all(np.abs(np.diff(group["time"]) - sidereal_day) < 0.5)
         assert np.all(np.diff(group["transit_day"]) == 1) and np.all(sides[1:] != sides[:-1])
-    for _, group in df.groupby(["tube_id", "pixel_index", "side"], observed=True):
+    for _, group in df.groupby(["tube_id", "filter", "pixel_index", "side"], observed=True):
         assert np.allclose(np.diff(group["time"]), 2.0 * sidereal_day)
     # Rising (east) crossings precede the pixel's meridian transit; setting crossings follow it.
     lst = Time(df["time"].to_numpy(), format="mjd").sidereal_time("mean", longitude=SO_LONGITUDE_DEG).deg
@@ -188,7 +198,7 @@ def test_table_alternates_rising_and_setting(time_maps, table):
     assert np.all((hour_angle < 0) == (df["side"] == "east"))
     west_first = SimonsObservatoryObsTable.from_time_maps(time_maps, START, 3, first_side=1)._table
     assert np.all((west_first["side"] == "west") == (west_first["transit_day"] % 2 == 0))
-    assert set(table.filters) == {"MF", "UHF"}
+    assert set(table.filters) == {"f090", "f150", "f220", "f280"}
     assert np.all((df["time_start"] <= df["time"]) & (df["time"] <= df["time_end"]))
     assert np.allclose((df["time_end"] - df["time_start"]) * 86400.0, df["duration_s"])
     assert set(df["side"]) <= set(SIDE_NAMES)
@@ -231,7 +241,9 @@ def test_time_map_io(time_maps, tmp_path):
 
 def test_simulate_lightcurves(time_maps, passbands_dir):
     """The standard simulation path works on an SO table with per-row flux errors."""
-    table = SimonsObservatoryObsTable.from_time_maps(time_maps, START, 3, tubes=[0], filter_names=["g"] * 13)
+    table = SimonsObservatoryObsTable.from_time_maps(
+        time_maps, START, 3, tubes=[0], band_names={"UHF": ("g",)}
+    )
     table.add_column("bandflux_error", 10.0 / np.sqrt(table["exposure_s"]))
     row = table._table.iloc[0]
     passbands = PassbandGroup.from_preset("LSST", table_dir=passbands_dir, filters=["g"])
@@ -284,3 +296,94 @@ def test_table_downtime(time_maps, table):
     assert not np.any(
         overlaps_intervals(reduced["time_start"].to_numpy(), reduced["time_end"].to_numpy(), downtime)
     )
+
+
+def test_sun_moon_cut(time_maps, table):
+    """The cut matches astropy separations and the table keeps nothing within 30 deg."""
+    full = SimonsObservatoryObsTable.from_time_maps(time_maps, START, 3, avoid_deg=None)._table
+    df = table._table
+    assert len(full) > len(df)
+    for data in (full.iloc[::500], df.iloc[::500]):
+        t = Time(data["time"].to_numpy(), format="mjd")
+        pos = SkyCoord(data["ra"].to_numpy() * u.deg, data["dec"].to_numpy() * u.deg)
+        # The GCRS body direction (barycentric ICRS would be wrong for the sun and moon).
+        bodies = (get_body(b, t, SO_SITE) for b in ("sun", "moon"))
+        sep = np.minimum(*(pos.separation(SkyCoord(g.ra, g.dec)).deg for g in bodies))
+        flagged = sun_moon_cut(data["time"], data["ra"], data["dec"])
+        assert np.all(flagged[sep < 29.5]) and not np.any(flagged[sep > 30.5])
+    assert not np.any(sun_moon_cut(df["time"], df["ra"], df["dec"]))
+
+
+def test_conserve_exposure(time_maps, table):
+    """Sun and moon avoidance keeps each tube's daily exposure unchanged."""
+    full = SimonsObservatoryObsTable.from_time_maps(time_maps, START, 3, avoid_deg=None)._table
+    df = table._table
+    daily = lambda d: d.groupby([d["tube_id"], np.floor(d["time"])])["exposure_s"].sum()  # noqa: E731
+    np.testing.assert_allclose(daily(df), daily(full).loc[daily(df).index], rtol=1e-5)
+    assert np.all(df["exposure_scale"] >= 1.0) and np.any(df["exposure_scale"] > 1.0)
+    small = full.iloc[:4].assign(tube_id=0, time=np.floor(full["time"].iloc[0]) + 0.1, exposure_s=1.0)
+    out = conserve_exposure(small, np.array([True, False, False, False]))
+    np.testing.assert_allclose(out["exposure_s"], 4.0 / 3.0)
+
+
+def test_bands_per_tube(table):
+    """Each visit gives one identical row per band of its tube."""
+    df = table._table
+    keys = ["tube_id", "pixel_index", "time"]
+    for tube, bands in ((0, {"f220", "f280"}), (9, {"f090", "f150"})):
+        rows = df[df["tube_id"] == tube]
+        assert set(rows["filter"]) == bands
+        per_visit = rows.groupby(keys, observed=True)["filter"].agg(lambda f: frozenset(f))
+        assert np.all(per_visit == frozenset(bands))
+        first, second = (rows[rows["filter"] == b].sort_values(keys) for b in sorted(bands))
+        assert np.array_equal(first["exposure_s"].to_numpy(), second["exposure_s"].to_numpy())
+
+
+def test_main_lobe():
+    """Only the contiguous region around the peak above the threshold is kept."""
+    response = np.array([0.0, 0.2, 0.0, 0.0, 0.5, 1.0, 0.6, 0.005, 0.3])
+    assert np.array_equal(main_lobe(response), [0, 0, 0, 0, 1, 1, 1, 0, 0])
+
+
+def test_so_passbands(tmp_path):
+    """Bandpasses on a GHz grid load as passbands without the low-frequency artifact."""
+    freq = np.linspace(0.0, 200.0, 201)
+    band = lambda center: np.exp(-0.5 * ((freq - center) / 10.0) ** 2)  # noqa: E731
+    artifact = 0.2 * (freq < 10.0)
+    fname = tmp_path / "bands.csv"
+    df = {"frequency": freq, "median_f090": band(90.0) + artifact - 0.01, "median_f150": band(150.0)}
+    pd.DataFrame(df).to_csv(fname, index=False)
+    assert set(so_passbands(fname, tophats={}).filters) == {"f090", "f150"}
+    group = so_passbands(fname)
+    assert set(group.filters) == {"f030", "f040", "f090", "f150"}
+    for name, (center, width) in SO_LF_TOPHATS.items():
+        ghz = 2.99792458e18 / group[name].waves / 1e9
+        np.testing.assert_allclose([ghz.min(), ghz.max()], [center - width / 2, center + width / 2])
+    for name, center in (("f090", 90.0), ("f150", 150.0)):
+        ghz = 2.99792458e18 / group[name].waves / 1e9
+        assert np.all(np.diff(group[name].waves) > 0)
+        assert 50.0 < ghz.min() < center < ghz.max() < 200.0
+
+
+def test_so_passband_bolometer_weighting():
+    """Band fluxes weight f_nu uniformly in frequency (bolometer), not by 1/frequency."""
+    for passband in tophat_passbands({"wide": (40.0, 40.0)}):
+        nu = 2.99792458e18 / passband.waves / 1e9
+        flux = passband.fluxes_to_bandflux(nu[None, :] ** 2)
+        # Flat weighting over 20-60 GHz: mean of nu^2 = (60^3 - 20^3) / (3 * 40).
+        np.testing.assert_allclose(flux, (60.0**3 - 20.0**3) / 120.0, rtol=1e-3)
+
+
+def test_bandflux_error(time_maps, table):
+    """A day's visits of a band, combined over all its tubes, reach the daily depth."""
+    reference = daily_reference_exposure(time_maps)
+    assert reference["f090"] == pytest.approx(8 * reference["f220"] / 4)
+    assert 2.0 < reference["f220"] / 4 < 6.0  # per-tube daily exposure of a few seconds
+    table = table.copy()
+    add_bandflux_error(table, time_maps)
+    df = table._table
+    for band in ("f090", "f220"):
+        rows = df[df["filter"] == band]
+        # A visit with the full daily exposure would reach the daily depth (nJy); noise ~ 1/sqrt(t).
+        depth = rows["bandflux_error"] * np.sqrt(rows["exposure_s"] / reference[band])
+        np.testing.assert_allclose(depth, SO_DAILY_DEPTH_MJY[band] * 1e6, rtol=1e-5)

@@ -7,7 +7,8 @@ each tube and range on a pixell CAR map, and materialize those maps into a stand
 one row per (tube, day, observed pixel). Because the scan is defined in local sidereal time (LST),
 it repeats every sidereal day, so the simulated day is replicated for the full date range.
 Pointings are precessed from the mean equator and equinox of a reference epoch to ICRS, and
-instrument downtime can be simulated and removed from the table.
+instrument downtime can be simulated and removed from the table, and visits within 30 deg of the
+sun or moon are dropped with their exposure given to the rest of that day's sky (see below).
 
 Idealized scan model
 --------------------
@@ -21,15 +22,29 @@ Idealized scan model
 * Precession is computed once for the reference epoch (it moves the sky by ~0.014 deg per year);
   refraction (~0.01 deg at 40 deg elevation), nutation and aberration (< 0.006 deg) are ignored.
 * 13 tubes of 1.25 deg diameter in a hex pattern (1.75 deg spacing, half the outer ring
-  missing); 8 MF, 4 UHF, 1 LF. A pixel is hit whenever its center is inside a tube's FoV.
+  missing); 8 MF, 4 UHF, 1 LF (``SO_TUBE_TYPES``). A pixel is hit whenever its center is inside
+  a tube's FoV.
+* Tubes are dichroic, so each visit gives one row per band of the tube (``SO_TUBE_BANDS``):
+  LF -> f030, f040; MF -> f090, f150; UHF -> f220, f280.
+* Visits whose pixel is within 30 deg of the sun or moon are dropped (SO scans another patch).
+* ASSUMPTION (sun/moon avoidance conserves observing time): SO's scheduler moves scans away from
+  the sun and moon rather than idling, so avoidance does not reduce the total observing time. We
+  do not model where the displaced scans go. Instead, the exposure removed by the cut on each UTC
+  day is redistributed uniformly over that tube's remaining visits that day: their ``exposure_s``
+  is multiplied by ``exposure_scale`` = 1 / (1 - f), where f is the fraction of the day's exposure
+  that was cut (~14% on average, 4-29% per day). Total daily (and yearly) exposure therefore
+  matches a table without the cut, but the extra depth is spread evenly instead of landing on
+  the specific patches the real scheduler would choose.
 * Each pixel is therefore observed at most once per tube per sidereal day.
 """
 
 import erfa
 import numpy as np
 import pandas as pd
+from astropy.coordinates import EarthLocation, get_body
 from astropy.time import Time
 
+from lightcurvelynx.astro_utils.passbands import Passband, PassbandGroup
 from lightcurvelynx.obstable.obs_table import ObsTable
 
 try:
@@ -39,8 +54,24 @@ except ImportError:  # pragma: no cover
 
 SO_LATITUDE_DEG = -(22.0 + 57.0 / 60.0 + 31.0 / 3600.0)
 SO_LONGITUDE_DEG = -(67.0 + 47.0 / 60.0 + 15.0 / 3600.0)
-SO_TUBE_FILTERS = ("MF",) * 8 + ("UHF",) * 4 + ("LF",)
+SO_AVOID_DEG = 30.0
+# Tube index -> optics tube name and type. Index 0 is the central tube, 1-6 the inner ring and
+# 7-12 the outer ring, in the order of ``tube_offsets``. ASSUMPTION: i1-i6 and o1-o6 are numbered
+# in the same rotational order (and with the same starting angle) as ``tube_offsets``; the true
+# focal-plane orientation of the numbering has not been checked. Types are from the UFM
+# assignment (uv = UHF, mv = MF, ln = LF).
+SO_TUBE_NAMES = ("c1", "i1", "i2", "i3", "i4", "i5", "i6", "o1", "o2", "o3", "o4", "o5", "o6")
+SO_TUBE_TYPES = ("UHF", "MF", "UHF", "MF", "MF", "UHF", "MF", "UHF", "MF", "MF", "MF", "MF", "LF")
+# Each tube is dichroic: every visit observes both bands of its type simultaneously.
+SO_TUBE_BANDS = {"LF": ("f030", "f040"), "MF": ("f090", "f150"), "UHF": ("f220", "f280")}
 SIDEREAL_DAY_S = 86164.0905
+SPEED_OF_LIGHT_A_S = 2.99792458e18  # Angstrom per second
+NJY_PER_MJY = 1e6
+# Expected point-source depth (1 sigma, mJy) of one full day's map per band, combining all tubes
+# that observe the band.
+SO_DAILY_DEPTH_MJY = {"f030": 37.0, "f040": 25.0, "f090": 6.9, "f150": 8.3, "f220": 26.0, "f280": 49.0}
+# LF bands have no measured bandpass: top-hats of unit response, (center, full width) in GHz.
+SO_LF_TOPHATS = {"f030": (27.9, 4.7), "f040": (40.2, 16.9)}
 SO_DEFAULT_EPOCH_MJD = 61406.0  # 2027-01-01
 MAP_FIELDS = ("hits", "time_s", "start_s", "duration_s", "exposure_s", "n_passes")
 SIDE_NAMES = ("east", "west")
@@ -54,6 +85,133 @@ SCAN_DEFAULTS = {
     "fov_deg": 1.25,
     "tube_spacing_deg": 1.75,
 }
+
+
+def main_lobe(response, threshold=0.01):
+    """Return a mask of the contiguous region around the peak where the response exceeds a threshold.
+
+    Measured SO bandpasses have low-frequency artifacts (up to ~20% of the peak at a few GHz). Once
+    converted to wavelength those span an enormous range and would dominate the passband, so only
+    the main lobe around the peak is kept.
+
+    Parameters
+    ----------
+    response : numpy.ndarray
+        Spectral response on an increasing frequency grid.
+    threshold : float
+        Fraction of the peak response that bounds the main lobe.
+
+    Returns
+    -------
+    numpy.ndarray
+        Boolean mask that is True inside the main lobe.
+    """
+    above = np.asarray(response) > threshold * np.max(response)
+    peak = np.argmax(response)
+    # Label contiguous runs of ``above``; keep the run that contains the peak.
+    runs = np.cumsum(np.diff(above.astype(int), prepend=0) != 0)
+    return above & (runs == runs[peak])
+
+
+def ghz_passband(freq_ghz, response, name, survey="SO"):
+    """Build a bolometer Passband from a response sampled on an increasing frequency grid (GHz).
+
+    SO detectors are bolometers, so the band-averaged flux density is weighted uniformly in
+    frequency: F_b = int f_nu S(nu) dnu / int S(nu) dnu. lightcurvelynx instead normalizes a
+    transmission table T with the photon-counting convention, F_b = int f_nu T(lam) / lam dlam /
+    int T(lam) / lam dlam, which equals weighting f_nu by T / nu. Passing T = S * nu therefore
+    gives the bolometer weighting; the stored ``transmission_table`` is S * nu (in GHz), not the
+    measured response.
+
+    Parameters
+    ----------
+    freq_ghz : numpy.ndarray
+        Positive, increasing frequencies in GHz.
+    response : numpy.ndarray
+        Spectral response S at each frequency (flat, bolometer weighting).
+    name : str
+        Filter name.
+    survey : str
+        Survey name.
+
+    Returns
+    -------
+    Passband
+        The passband on the native grid converted to wavelengths in Angstroms.
+    """
+    freq_ghz = np.asarray(freq_ghz, dtype=float)
+    table = np.column_stack((SPEED_OF_LIGHT_A_S / (freq_ghz * 1e9), np.asarray(response) * freq_ghz))[::-1]
+    return Passband(table, survey, name, delta_wave=None, trim_quantile=None)
+
+
+def tophat_passbands(tophats=None, *, step_ghz=0.1, survey="SO"):
+    """Build unit-response top-hat passbands.
+
+    Parameters
+    ----------
+    tophats : dict, optional
+        Maps filter name to (center, full width) in GHz. Defaults to ``SO_LF_TOPHATS``.
+    step_ghz : float
+        Frequency sampling of each top-hat in GHz.
+    survey : str
+        Survey name.
+
+    Returns
+    -------
+    list of Passband
+        One passband per entry, with response 1 from center - width/2 to center + width/2.
+    """
+    tophats = SO_LF_TOPHATS if tophats is None else tophats
+    passbands = []
+    for name, (center, width) in tophats.items():
+        freq = np.linspace(center - width / 2, center + width / 2, int(np.ceil(width / step_ghz)) + 1)
+        passbands.append(ghz_passband(freq, np.ones_like(freq), name, survey))
+    return passbands
+
+
+def so_passbands(files, *, threshold=0.01, min_ghz=40.0, tophats=None, survey="SO"):
+    """Load SO bandpasses measured on a frequency grid into a PassbandGroup.
+
+    Each CSV file has a ``frequency`` column (GHz) and one ``median_<band>`` column per band (e.g.
+    ``LAT_MF_median_bands.csv`` with ``median_f090`` and ``median_f150``). Negative responses are
+    set to zero, only the main lobe of each band is kept (``main_lobe``), and frequencies are
+    converted to wavelengths in Angstroms. The native grid is kept (no resampling or trimming).
+    The band names (``f090``, ...) match ``SO_TUBE_BANDS``. Bands without a measured bandpass
+    (by default LF: ``f030`` and ``f040``) are added as unit-response top-hats from ``tophats``.
+
+    The measured detectors do not respond below ~40 GHz, so any response there (an artifact of
+    the measurement) is removed with ``min_ghz``. Band fluxes use flat (bolometer) weighting in
+    frequency; see ``ghz_passband``.
+
+    Parameters
+    ----------
+    files : str, Path or list of them
+        CSV bandpass files.
+    threshold : float
+        Fraction of the peak response that bounds each band's main lobe.
+    min_ghz : float
+        Measured responses below this frequency (GHz) are set to zero. Not applied to top-hats.
+    tophats : dict, optional
+        Top-hat bands to add, as name -> (center, full width) in GHz. Defaults to
+        ``SO_LF_TOPHATS``; pass an empty dict to add none.
+    survey : str
+        Survey name of the passbands.
+
+    Returns
+    -------
+    PassbandGroup
+        One passband per ``median_<band>`` column plus one per top-hat.
+    """
+    passbands = tophat_passbands(tophats, survey=survey)
+    for fname in np.atleast_1d(files):
+        data = pd.read_csv(fname).sort_values("frequency")
+        freq_ghz = data["frequency"].to_numpy()
+        for column in (c for c in data.columns if c.startswith("median_")):
+            response = np.where(freq_ghz >= min_ghz, np.clip(data[column].to_numpy(), 0.0, None), 0.0)
+            keep = main_lobe(response, threshold) & (response > 0)
+            name = column.removeprefix("median_")
+            passbands.append(ghz_passband(freq_ghz[keep], response[keep], name, survey))
+    return PassbandGroup(passbands)
 
 
 def _require_pixell():
@@ -721,6 +879,75 @@ def simulate_downtime(
     return intervals
 
 
+def sun_moon_cut(time_mjd, ra_deg, dec_deg, avoid_deg=SO_AVOID_DEG, step_min=10.0):
+    """Flag observations that point within ``avoid_deg`` of the sun or the moon.
+
+    SO does not observe near the sun or moon; it scans another patch instead, so those visits
+    are lost. The topocentric sun and moon positions are computed on a regular time grid and each
+    observation uses the nearest grid time (the moon moves about 0.5 deg per hour, so the default
+    10 minute grid is accurate to ~0.1 deg).
+
+    Parameters
+    ----------
+    time_mjd : numpy.ndarray
+        Observation times in MJD.
+    ra_deg, dec_deg : numpy.ndarray
+        Pointing coordinates in degrees (same length as ``time_mjd``).
+    avoid_deg : float
+        Minimum allowed separation from the sun and the moon in degrees.
+    step_min : float
+        Time grid step in minutes.
+
+    Returns
+    -------
+    numpy.ndarray
+        Boolean array that is True for observations too close to the sun or moon.
+    """
+    time_mjd, ra_deg, dec_deg = (np.asarray(v, dtype=float) for v in (time_mjd, ra_deg, dec_deg))
+    if len(time_mjd) == 0:
+        return np.zeros(0, dtype=bool)
+    step = step_min / 1440.0
+    grid = np.arange(time_mjd.min(), time_mjd.max() + step, step)
+    site = EarthLocation.from_geodetic(SO_LONGITUDE_DEG, SO_LATITUDE_DEG, height=5200.0)
+    index = np.rint((time_mjd - grid[0]) / step).astype(int)
+    too_close = np.zeros(len(time_mjd), dtype=bool)
+    for body in ("sun", "moon"):
+        pos = get_body(body, Time(grid, format="mjd"), site)
+        sep = angular_separation_deg(ra_deg, dec_deg, pos.ra.deg[index], pos.dec.deg[index])
+        too_close |= sep < avoid_deg
+    return too_close
+
+
+def conserve_exposure(table, cut):
+    """Drop cut visits and give their exposure to the remaining visits of the same tube and day.
+
+    This implements the assumption that sun and moon avoidance re-points the telescope rather than
+    losing observing time: on each UTC day, the surviving visits of each tube have their
+    ``exposure_s`` multiplied by ``1 / (1 - f)``, where ``f`` is the fraction of that tube's
+    exposure on that day removed by ``cut``. The factor is stored in ``exposure_scale``. A day on
+    which every visit of a tube is cut has no visits left to receive the time, so it is lost.
+
+    Parameters
+    ----------
+    table : pandas.DataFrame
+        Visit table with ``time`` (MJD), ``tube_id`` and ``exposure_s`` columns.
+    cut : numpy.ndarray
+        Boolean array, True for visits to drop.
+
+    Returns
+    -------
+    pandas.DataFrame
+        The surviving visits with rescaled ``exposure_s`` and the ``exposure_scale`` column.
+    """
+    group = [table["tube_id"].to_numpy(), np.floor(table["time"].to_numpy())]
+    exposure = table["exposure_s"].astype(float)
+    total = exposure.groupby(group).transform("sum")
+    kept = exposure.where(~cut, 0.0).groupby(group).transform("sum")
+    table = table.assign(exposure_scale=(total / kept).astype(np.float32))[~cut]
+    table["exposure_s"] = (table["exposure_s"] * table["exposure_scale"]).astype(np.float32)
+    return table.reset_index(drop=True)
+
+
 def visit_schedule(time_maps, tube, side, start_date, n_days, *, first_side=0, downtime=None):
     """Return the visits of one tube on one scan side over a date range.
 
@@ -773,6 +1000,64 @@ def visit_schedule(time_maps, tube, side, start_date, n_days, *, first_side=0, d
     return visits
 
 
+def daily_reference_exposure(time_maps, band_names=None):
+    """Return the typical exposure of one full day's map per band, summed over the band's tubes.
+
+    For each simulated tube, a pixel's daily exposure is the mean of its east and west crossing
+    exposures (successive days alternate between them); the tube's typical value is the median over
+    observed pixels. The tubes have nearly identical values (~3.8 s), so the band's reference is the
+    mean over the simulated tubes times the number of SO tubes observing the band (e.g. 8 for f090).
+    Downtime and the sun and moon cut are not included: the depths describe a typical observing day,
+    and ``conserve_exposure`` keeps the average daily exposure unchanged.
+
+    Parameters
+    ----------
+    time_maps : dict
+        Output of ``simulate_time_maps`` or ``read_time_maps`` (any subset of tubes).
+    band_names : dict, optional
+        Maps tube type to its band names. Defaults to ``SO_TUBE_BANDS``.
+
+    Returns
+    -------
+    dict
+        Reference daily exposure in seconds for each band.
+    """
+    band_names = SO_TUBE_BANDS if band_names is None else band_names
+    exposure = np.asarray(time_maps["maps"][MAP_FIELDS.index("exposure_s")]).mean(axis=1)
+    per_tube = np.mean([np.median(daily[daily > 0]) for daily in exposure])
+    n_tubes = {kind: SO_TUBE_TYPES.count(kind) for kind in band_names}
+    return {band: n_tubes[kind] * per_tube for kind, bands in band_names.items() for band in bands}
+
+
+def add_bandflux_error(table, time_maps, *, depths=None, band_names=None):
+    """Add a ``bandflux_error`` column (nJy) from the daily map depths, scaled by each visit's exposure.
+
+    Noise scales as 1 / sqrt(exposure), so a visit with exposure ``exposure_s`` has error
+    ``depth * sqrt(T_day / exposure_s)``, where ``depth`` is the band's depth for one full day's
+    map and ``T_day`` is that map's typical exposure (``daily_reference_exposure``). Use with
+    ``GivenNoiseModel``.
+
+    Parameters
+    ----------
+    table : SimonsObservatoryObsTable
+        The table to modify in place.
+    time_maps : dict
+        The time maps the table was built from.
+    depths : dict, optional
+        One-day map depth (1 sigma, mJy) per band. Defaults to ``SO_DAILY_DEPTH_MJY``.
+    band_names : dict, optional
+        Maps tube type to its band names. Defaults to ``SO_TUBE_BANDS``.
+    """
+    depths = SO_DAILY_DEPTH_MJY if depths is None else depths
+    reference = daily_reference_exposure(time_maps, band_names)
+    bands = table["filter"].to_numpy(dtype=str)
+    error = np.empty(len(bands))
+    for band in np.unique(bands):
+        rows = bands == band
+        error[rows] = depths[band] * NJY_PER_MJY * np.sqrt(reference[band] / table["exposure_s"][rows])
+    table.add_column("bandflux_error", error, overwrite=True)
+
+
 class SimonsObservatoryObsTable(ObsTable):
     """An ObsTable of Simons Observatory map-pixel observations for one or more optics tubes.
 
@@ -821,9 +1106,10 @@ class SimonsObservatoryObsTable(ObsTable):
         n_days,
         *,
         tubes=None,
-        filter_names=None,
+        band_names=None,
         first_side=0,
         downtime=None,
+        avoid_deg=SO_AVOID_DEG,
         **kwargs,
     ):
         """Materialize simulated time maps into an ObsTable over a date range.
@@ -841,14 +1127,22 @@ class SimonsObservatoryObsTable(ObsTable):
             Survey length in days; rows outside [start, start + n_days) are dropped.
         tubes : list of int, optional
             Tubes to include. Defaults to all tubes in ``time_maps``.
-        filter_names : sequence of str, optional
-            Filter label for each of the 13 tubes. Defaults to ``SO_TUBE_FILTERS``.
+        band_names : dict, optional
+            Maps each tube type (``LF``, ``MF``, ``UHF``) to the filter names of the bands it
+            observes; each visit gives one row per band, with that band as ``filter``. The names
+            must match the passbands used with the table. Defaults to ``SO_TUBE_BANDS``.
         first_side : int
             Scan side (0 = east/rising, 1 = west/setting) for transits on the sidereal day (from
             LST = 0) containing the start; the sides alternate on later days.
         downtime : numpy.ndarray, optional
             Downtime intervals (MJD), e.g. from ``simulate_downtime``; visits overlapping them
             are dropped.
+        avoid_deg : float or None
+            Visits whose pixel center is within this many degrees of the sun or the moon at the
+            mean visit time are dropped (SO scans another patch instead). Their exposure is
+            redistributed over the tube's remaining visits that day by ``conserve_exposure``, so
+            total observing time is unchanged (an assumption; see the module docstring). None
+            disables the cut and the rescaling.
         **kwargs
             Additional survey values passed to the constructor.
 
@@ -858,22 +1152,26 @@ class SimonsObservatoryObsTable(ObsTable):
             The materialized observation table, sorted by time.
         """
         _require_pixell()
-        filter_names = SO_TUBE_FILTERS if filter_names is None else filter_names
+        band_names = SO_TUBE_BANDS if band_names is None else band_names
         maps, map_tubes = time_maps["maps"], list(time_maps["tubes"])
         tubes = map_tubes if tubes is None else np.atleast_1d(tubes)
 
         pieces = []
         for tube, side in ((tube, side) for tube in tubes for side in range(2)):
+            bands = list(band_names[SO_TUBE_TYPES[tube]])
             visits = visit_schedule(
                 time_maps, tube, side, start_date, n_days, first_side=first_side, downtime=downtime
             )
+            # One row per (visit, band): repeat every visit for each band of the tube.
+            band_codes = np.repeat(np.arange(len(bands)), len(visits["pixel"]))
+            visits = {key: np.tile(value, len(bands)) for key, value in visits.items()}
             pix = visits["pixel"]
             fields = maps[:, map_tubes.index(tube), side].reshape(len(MAP_FIELDS), -1)
             pieces.append(
                 pd.DataFrame(
                     {
                         **{key: visits[key] for key in ("time", "time_start", "time_end")},
-                        "filter": pd.Categorical.from_codes(np.zeros(len(pix), int), [filter_names[tube]]),
+                        "filter": pd.Categorical.from_codes(band_codes, bands),
                         "tube_id": np.full(len(pix), tube, dtype=np.int16),
                         "side": pd.Categorical.from_codes(np.full(len(pix), side), SIDE_NAMES),
                         "transit_day": visits["transit_day"].astype(np.int16),
@@ -893,6 +1191,10 @@ class SimonsObservatoryObsTable(ObsTable):
         table = pd.concat(pieces, ignore_index=True).sort_values("time", ignore_index=True)
         dec, ra = np.degrees(np.asarray(maps.posmap()).reshape(2, -1)[:, table["pixel_index"].to_numpy()])
         table["ra"], table["dec"] = ra % 360.0, dec
+        if avoid_deg is not None:
+            table = conserve_exposure(
+                table, sun_moon_cut(table["time"], table["ra"], table["dec"], avoid_deg)
+            )
         kwargs.setdefault("radius", time_maps["res_deg"] / np.sqrt(2.0))
         kwargs.setdefault("scan_elevation_deg", time_maps["elevation_deg"])
         kwargs.setdefault("fov_deg", time_maps["fov_deg"])

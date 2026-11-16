@@ -30,7 +30,7 @@ from lightcurvelynx.obstable.simons_observatory_obstable import (  # noqa: E402
     SIDE_NAMES,
     SIDEREAL_DAY_S,
     SO_LONGITUDE_DEG,
-    SO_TUBE_FILTERS,
+    SO_TUBE_TYPES,
     SimonsObservatoryObsTable,
     point_visits,
     read_time_maps,
@@ -172,7 +172,7 @@ def plot_tube_grid(time_maps, field, side, fname):
     vmin, vmax = np.nanmin(data), np.nanmax(data)
     for ax, tube, image in zip(axes.flat, tubes, data, strict=False):
         artist = sky_imshow(ax, image, maps, cmap=cmap, vmin=vmin, vmax=vmax)
-        ax.set_title(f"Tube {tube} ({SO_TUBE_FILTERS[tube]})", fontsize=10)
+        ax.set_title(f"Tube {tube} ({SO_TUBE_TYPES[tube]})", fontsize=10)
     for ax in axes.flat[len(tubes) :]:
         ax.set_visible(False)
     fig.colorbar(artist, ax=axes, label=label, shrink=0.8)
@@ -202,7 +202,7 @@ def plot_single_map(time_maps, tube, side, fname):
         artist = sky_imshow(ax, data, maps, cmap=cmap)
         fig.colorbar(artist, ax=ax, label=textwrap.fill(label, 28), shrink=0.8)
         ax.set_title(field, fontsize=10)
-    fig.suptitle(f"Tube {tube} ({SO_TUBE_FILTERS[tube]}), {('rising', 'setting')[side]} crossing")
+    fig.suptitle(f"Tube {tube} ({SO_TUBE_TYPES[tube]}), {('rising', 'setting')[side]} crossing")
     fig.savefig(fname, dpi=110, bbox_inches="tight")
     plt.close(fig)
 
@@ -243,7 +243,7 @@ def plot_layout(time_maps, fname):
     offsets = tube_offsets(time_maps["tube_spacing_deg"])
     fig, ax = plt.subplots(figsize=(4.5, 4.5))
     for tube, (x, y) in enumerate(offsets):
-        filt = SO_TUBE_FILTERS[tube]
+        filt = SO_TUBE_TYPES[tube]
         alpha = 0.6 if tube in time_maps["tubes"] else 0.15
         ax.add_patch(plt.Circle((x, y), time_maps["fov_deg"] / 2, color=BAND_COLORS[filt], alpha=alpha))
         ax.text(x, y, f"{tube}\n{filt}", ha="center", va="center", fontsize=8)
@@ -358,7 +358,7 @@ def year_visits(time_maps, start, first_side, downtime, block_days=30.0):
                     downtime=downtime,
                 )
                 utc_day = np.floor(visits["time"] - start_mjd).astype(int)
-                yield SO_TUBE_FILTERS[tube], visits["pixel"], visits["transit_day"] + offset, utc_day
+                yield SO_TUBE_TYPES[tube], visits["pixel"], visits["transit_day"] + offset, utc_day
 
 
 def year_coverage(time_maps, start, first_side, downtime, area, footprint=None):
@@ -388,7 +388,7 @@ def year_coverage(time_maps, start, first_side, downtime, area, footprint=None):
         transit days, weighted by pixel area).
     """
     npix = area.size
-    bands = [*sorted({SO_TUBE_FILTERS[tube] for tube in time_maps["tubes"]}), "all"]
+    bands = [*sorted({SO_TUBE_TYPES[tube] for tube in time_maps["tubes"]}), "all"]
     n_transit, n_utc = int(YEAR_DAYS * 86400.0 / SIDEREAL_DAY_S) + 3, int(np.ceil(YEAR_DAYS))
     flags = {band: (np.zeros((npix, n_transit), bool), np.zeros((npix, n_utc), bool)) for band in bands}
     for band, pixel, transit, utc_day in year_visits(time_maps, start, first_side, downtime):
@@ -719,7 +719,11 @@ successive transit days use opposite crossings. Each range is simulated for a fu
 <li>Each pixel is therefore observed at most once per tube per day. Row time is the hit-weighted (circular)
 mean of that crossing.</li>
 <li>13 tubes, 1.25&deg; field of view, 1.75&deg; hex spacing with half the outer ring missing; 8 MF,
-4 UHF, 1 LF.</li>
+4 UHF, 1 LF. Tubes are dichroic, so each visit gives one row per band (LF: f030/f040, MF: f090/f150,
+UHF: f220/f280).</li>
+<li>Sun and moon avoidance: visits within 30&deg; of the sun or moon are dropped. <b>Assumption:</b> the
+scheduler re-points instead of idling, so the exposure cut each day is redistributed uniformly over that
+tube's remaining visits (<code>exposure_scale</code>); total observing time is unchanged.</li>
 <li>Pointings are precessed (IAU 2006) from the mean equator and equinox of one epoch, mid-way through
 the year, to ICRS; over a multi-year survey this drifts by ~0.014&deg; per year. Refraction (~0.01&deg;
 at 40&deg; elevation), nutation and aberration (&lt;0.006&deg;) are ignored.</li>
@@ -803,7 +807,7 @@ def main():
         for side, name in enumerate(SIDE_NAMES):
             add(
                 f"single_tube{tube}_{name}",
-                f"Single time map: tube {tube} ({SO_TUBE_FILTERS[tube]}), {('rising', 'setting')[side]}",
+                f"Single time map: tube {tube} ({SO_TUBE_TYPES[tube]}), {('rising', 'setting')[side]}",
                 "All six map fields for this one tube and crossing; pixels never observed are blank.",
                 plot_single_map,
                 time_maps,
