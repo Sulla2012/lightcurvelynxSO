@@ -244,22 +244,30 @@ Note that if you want to produce exactly the same results, you can instead provi
 Running in Parallel
 -------------------------------------------------------------------------------
 
-Simulations can be performed in parallel by providing a ``concurrent.futures.Executor`` object.
-This object can be a built-in parallelization method, such as `ThreadPoolExecutor` or
-`ProcessPoolExecutor`, or other libraries, such as `dask <https://docs.dask.org/en/latest/>`_ or
-`ray <https://docs.ray.io/en/latest/>`_. Note that each process will load a full version of all the data,
-so they may be memory intensive.
+Simulations can be performed in parallel by providing a ``concurrent.futures.Executor`` object via the `executor` parameter or setting the `num_jobs` parameter. For single machine parallelization, we recommend just using the `num_jobs` parameter as it sets defaults to minimize memory usage while ensuring safe execution.
 
-**NOTE**: Not all subpackages work with distributed computation yet. If you get an error about
-not being able to pickle an object, please let the LightCurveLynx team know so we can investigate.
+For more control, the users can instantiate their own executor object and pass it as a parameter. For example, you can use:
+
+* `ProcessPoolExecutor` with a specified number of workers. The context should be set as "spawn" or "forkserver" to avoid incompatibility issues with certain libraries and modules.
+* `Dask <https://docs.dask.org/en/latest/>`_ clients. You should always use `threads_per_worker=1` and `processes=True` to ensure each process runs in a separate thread-safe process.
+* `Joblib <https://joblib.readthedocs.io/en/stable/>`_ clients. We provide the `lightcurvelynx.utils.parallelization_utils.JoblibExecutor` wrapper for using joblib with the simulation framework.
+* `Loky <https://loky.readthedocs.io/en/stable/API.html>`_ clients.
+* `Ray <https://docs.ray.io/en/latest/>`_ clients.
+
+Because we cannot guarantee that all libraries and modules we use are thread safe (and some of our own models are **not** thread safe), we do not support `ThreadPoolExecutor` or other multi-threaded approaches such as `dask.distributed.Client(threads_per_worker>1)`. Please use single threaded executors such as `concurrent.futures.ProcessPoolExecutor` (with a context of spawn) or a `dask.distributed.Client` with `threads_per_worker=1`. For more information see the :doc:`parallelization notebook <notebooks/parallel_runs>`.
 
 The :doc:`parallelization notebook <notebooks/parallel_runs>` provides an example of how to use
 LightCurveLynx to run simulations in parallel including using dask and ray.
 
+**NOTES**:
+
+**NOTES**: 
+* At the minimum each machine will need to load a full copy of the data. For some executors (e.g. `ProcessPoolExecutor``), the job loads one copy **per-batch**. Thus, these approaches can be extremely memory-intensive. For single-machine simulation, we suggest using the `num_jobs` parameter, which uses safe-shared memory.
+* Not all sub-packages work with distributed computation yet. If you get an error about
+not being able to pickle an object, please let the LightCurveLynx team know so we can investigate.
+* Due to how the numbers are generated, the sampling will change when the batch size changes even if a seeded random number generator has been provided. See the :doc:`randomness <randomness>` page for more details.
 
 Results and Output
 -------------------------------------------------------------------------------
 
-The results of a simulation are returned as a `nested-pandas DataFrame <https://nested-pandas.readthedocs.io/en/latest/>`_.
-For details on the structure of the output and how to save it, see the 
-:doc:`Results and Output documentation page <results_and_output>`.
+The results of a simulation are returned as a `nested-pandas DataFrame <https://nested-pandas.readthedocs.io/en/latest/>`_. For details on the structure of the output and how to save it, see the :doc:`Results and Output documentation page <results_and_output>`.

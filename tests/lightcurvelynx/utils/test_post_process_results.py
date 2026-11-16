@@ -81,6 +81,80 @@ def test_concat_results():
     assert np.allclose(results["lightcurve"][4]["flux"], [22.0, 21.0])
 
 
+def test_concat_results_with_empty_lightcurves():
+    """Test that concat_results keeps the nested column when one batch has no observations."""
+    # A batch where no object matched any observation. Building the nested frame from
+    # empty lists (as the simulation does) gives every nested column a float dtype.
+    outer_dict_1 = {"id": [0, 1], "ra": [10.0, 20.0], "nobs": [0, 0]}
+    inner_dict_1 = {"mjd": [], "flux": [], "filter": [], "obs_idx": []}
+    res1 = NestedFrame(data=outer_dict_1, index=[0, 1])
+    res1 = res1.join_nested(pd.DataFrame(data=inner_dict_1, index=[]), "lightcurve")
+
+    outer_dict_2 = {"id": [0], "ra": [30.0], "nobs": [2]}
+    inner_dict_2 = {"mjd": [59000.0, 59001.0], "flux": [20.0, 22.0], "filter": ["g", "r"], "obs_idx": [4, 7]}
+    res2 = NestedFrame(data=outer_dict_2, index=[0])
+    res2 = res2.join_nested(pd.DataFrame(data=inner_dict_2, index=[0, 0]), "lightcurve")
+
+    results = concat_results([res1, res2])
+    assert len(results) == 3
+    assert results.columns.tolist() == ["id", "ra", "nobs", "lightcurve"]
+    assert results["id"].tolist() == [0, 1, 2]
+    assert results.nested_columns == ["lightcurve"]
+    assert results["lightcurve"].dtype == res2["lightcurve"].dtype
+    assert results["lightcurve.filter"].tolist() == ["g", "r"]
+    assert results["lightcurve.obs_idx"].tolist() == [4, 7]
+    assert np.allclose(results["lightcurve.flux"], [20.0, 22.0])
+
+
+def test_concat_results_all_empty_lightcurves():
+    """Test that concat_results leaves the nested column as is when no batch has observations."""
+    inner_dict = {"mjd": [], "flux": [], "filter": []}
+    res1 = NestedFrame(data={"id": [0, 1], "nobs": [0, 0]}, index=[0, 1])
+    res1 = res1.join_nested(pd.DataFrame(data=inner_dict, index=[]), "lightcurve")
+    res2 = NestedFrame(data={"id": [0], "nobs": [0]}, index=[0])
+    res2 = res2.join_nested(pd.DataFrame(data=inner_dict, index=[]), "lightcurve")
+
+    results = concat_results([res1, res2])
+    assert len(results) == 3
+    assert results["id"].tolist() == [0, 1, 2]
+    assert results.nested_columns == ["lightcurve"]
+    assert results["lightcurve"].dtype == res1["lightcurve"].dtype
+    assert results["lightcurve"].nest.flat_length == 0
+
+
+def test_concat_results_empty():
+    """Test the concat_results function on an empty list."""
+    with pytest.raises(ValueError, match="The results list is empty."):
+        concat_results([])
+
+
+def test_concat_results_single():
+    """Test the concat_results function on list with one element."""
+    # Create one NestedFrame to test single element concatenation.
+    outer_dict_1 = {
+        "id": [0, 1, 2],
+        "ra": [10.0, 20.0, 30.0],
+        "dec": [-10.0, 0.0, 10.0],
+        "nobs": [3, 2, 1],
+        "z": [0.1, 0.2, 0.3],
+    }
+    inner_dict_1 = {
+        "mjd": [59000, 59001, 59002, 59000, 59001, 59000],
+        "flux": [10.0, 12.0, 11.0, 15.0, 14.0, 13.0],
+        "fluxerr": [1.0, 1.0, 1.0, 1.5, 1.5, 1.0],
+        "filter": ["g", "r", "i", "g", "r", "i"],
+    }
+    nested_inds_1 = [0, 0, 0, 1, 1, 2]
+    res1 = NestedFrame(data=outer_dict_1, index=[0, 1, 2])
+    nested_1 = pd.DataFrame(data=inner_dict_1, index=nested_inds_1)
+    res1 = res1.join_nested(nested_1, "lightcurve")
+
+    # Concatenate the results.
+    results = concat_results([res1])
+    assert len(results) == 3
+    assert results.columns.tolist() == ["id", "ra", "dec", "nobs", "z", "lightcurve"]
+
+
 def test_results_append_param_as_col():
     """Test the results_append_param_as_col function."""
     # Create two NestedFrames to concatenate.
@@ -249,6 +323,34 @@ def test_results_drop_empty():
     assert len(filtered_results["lightcurve"][0]) == 3
     assert len(filtered_results["lightcurve"][2]) == 1
     assert len(filtered_results["lightcurve"][3]) == 2
+
+    # Try a nested frame with only spectra (no light curves).
+    results2 = NestedFrame(data=source_data, index=[0, 1, 2, 3, 4])
+    spectra_frame = pd.DataFrame(
+        data={"mjd": [59000, 59001, 59001, 59002, 59005]},
+        index=[0, 0, 2, 2, 4],
+    )
+    results2 = results2.join_nested(spectra_frame, "spectra")
+    assert len(results2) == 5
+    assert results2["object_id"].tolist() == [0, 1, 2, 3, 4]
+
+    # Apply the drop_empty function to the spectra only results.
+    filtered_results2 = results_drop_empty(results2)
+    assert len(filtered_results2) == 3
+    assert filtered_results2["object_id"].tolist() == [0, 2, 4]
+
+    # Try a nested frame with both lightcurves (rows 0, 2, and 3) and
+    # spectra (rows 0, 2, and 4).
+    results3 = NestedFrame(data=source_data, index=[0, 1, 2, 3, 4])
+    results3 = results3.join_nested(nested_frame, "lightcurve")
+    results3 = results3.join_nested(spectra_frame, "spectra")
+    assert len(results3) == 5
+    assert results3["object_id"].tolist() == [0, 1, 2, 3, 4]
+
+    # Apply the drop_empty function to the spectra + light curve results.
+    filtered_results3 = results_drop_empty(results3)
+    assert len(filtered_results3) == 4
+    assert filtered_results3["object_id"].tolist() == [0, 2, 3, 4]
 
 
 def test_lightcurve_compute_snr():

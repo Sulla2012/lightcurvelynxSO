@@ -26,6 +26,36 @@ def concat_results(results_list):
     nested_pandas.NestedFrame
         The concatenated DataFrame.
     """
+    # If the list is empty, throw an error.
+    if not results_list:
+        raise ValueError("The results list is empty.")
+
+    # If there is only one result, return it directly.
+    if len(results_list) == 1:
+        return results_list[0]
+
+    # A result where no object matched any observation has its nested columns built from
+    # empty lists, so every nested field gets an inferred float dtype. pandas >= 3 no longer
+    # ignores such empty entries when finding a common dtype, so concatenating them with
+    # non-empty results would turn the nested column into a plain object column. Cast the
+    # empty nested columns to the dtype of a result with data before concatenating.
+    results_list = list(results_list)
+    nested_cols = dict.fromkeys(col for res in results_list for col in res.nested_columns)
+    for col in nested_cols:
+        ref_dtype = next(
+            (
+                res[col].dtype
+                for res in results_list
+                if col in res.nested_columns and res[col].nest.flat_length > 0
+            ),
+            None,
+        )
+        if ref_dtype is None:
+            continue
+        for idx, res in enumerate(results_list):
+            if col in res.nested_columns and res[col].nest.flat_length == 0:
+                results_list[idx] = res.assign(**{col: res[col].astype(ref_dtype)})
+
     with warnings.catch_warnings():
         warnings.filterwarnings(
             "ignore", category=FutureWarning, message=".*DataFrame concatenation with empty.*"
@@ -45,14 +75,20 @@ def results_drop_empty(results):
     Parameters
     ----------
     results : nested_pandas.NestedFrame
-        The DataFrame containing lightcurve data.
+        The DataFrame containing light-curve and spectral data.
 
     Returns
     -------
     nested_pandas.NestedFrame
-        The DataFrame with empty lightcurves removed.
+        The DataFrame with rows containing empty light curves
+        and no spectra removed.
     """
-    return results.dropna(subset=["lightcurve"])
+    has_results = np.full(len(results), False, dtype=bool)
+    if "lightcurve" in results.columns:
+        has_results |= ~results["lightcurve"].isna()
+    if "spectra" in results.columns:
+        has_results |= ~results["spectra"].isna()
+    return results.loc[has_results]
 
 
 def results_append_param_as_col(results, param_name):

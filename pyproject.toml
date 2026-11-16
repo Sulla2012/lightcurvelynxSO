@@ -20,11 +20,11 @@ dependencies = [
     "astropy",
     "astroquery",
     "cdshealpix",
-    "citation-compass>=0.0.3",
+    "citation-compass>=0.1.0",
+    "joblib",  # Used for parallel execution with Joblib
     "matplotlib",
     "mocpy",
     "nested-pandas>=0.6.0",
-    "networkx",  # Used for graph visualization
     "numpy>=2.0",
     "pandas",
     "pooch",
@@ -42,7 +42,7 @@ dependencies = [
 # On a mac, install optional dependencies with `pip install '.[dev]'` (include the single quotes)
 [project.optional-dependencies]
 dev = [
-    "asv[virtualenv]==0.6.6", # Used to compute performance benchmarks
+    "asv==0.6.6", # Used to compute performance benchmarks
     "bilby",  # Used for Bayesian inference
     "dust_extinction",
     "extinction>=0.4.7",

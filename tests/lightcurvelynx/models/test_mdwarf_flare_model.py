@@ -1,12 +1,16 @@
 """Tests for the m dwarf flare model"""
 
-import numpy as np
-from astropy import units as u
+import warnings
 
+import numpy as np
+import pytest
+from astropy import units as u
+from astropy.cosmology import Planck18
+
+from lightcurvelynx.astro_utils.passbands import check_connect_to_svo
 from lightcurvelynx.models.mdwarf_flare_model import MDwarfFlareModel
 
-# test values with known output. first, no sampling
-
+# The test values with known output. first, no sampling
 wavelengths = np.linspace(3000, 12000, 4000)
 times = np.linspace(0, 20, 201)  # want peak time to actually be in times
 
@@ -32,6 +36,9 @@ def test_mdwarf_flare_model_with_assigned_inputs():
     Using specific inputs and making sure the values are what we expect
     (Not sampling from parameter distributions)
     """
+    if not check_connect_to_svo():
+        pytest.skip("Skipping test if we cannot connect to the SVO service.")
+
     star_temp = 4000
     star_radius = 0.09 * u.R_sun.to(u.cm)
     flare_fwhm = 0.1
@@ -48,25 +55,23 @@ def test_mdwarf_flare_model_with_assigned_inputs():
     )
 
     assert np.isclose(
-        model._quiescent_flux_no_distance(star_temp, wavelengths, for_tess=False)[0].value,
+        model._quiescent_flux_no_distance(star_temp, wavelengths)[0].value,
         9.133526742251799e-08,
     )
     assert np.isclose(
-        model._quiescent_flux_no_distance(star_temp, wavelengths=None, for_tess=True)[0].value,
+        model._quiescent_flux_no_distance(star_temp, model._tess_waves)[0].value,
         4.24870522231194e-06,
     )
 
+    assert np.isclose(model._build_spectrum_bb_with_balmer(wavelengths)[0].value, 0.00014342158215047032)
     assert np.isclose(
-        model._build_spectrum_bb_with_balmer(wavelengths, for_tess=False)[0].value, 0.00014342158215047032
-    )
-    assert np.isclose(
-        model._build_spectrum_bb_with_balmer(None, for_tess=True)[0].value, 0.00013805179319227408
+        model._build_spectrum_bb_with_balmer(model._tess_waves)[0].value, 0.00013805179319227408
     )
 
-    I_lam_star_for_tess = model._quiescent_flux_no_distance(star_temp, wavelengths=None, for_tess=True)
+    I_lam_star_for_tess = model._quiescent_flux_no_distance(star_temp, wavelengths=model._tess_waves)
     assert np.isclose(model._tess_band_integrate(I_lam_star_for_tess), 8.070721970058228e-06)
 
-    I_lam_flare_for_tess = model._build_spectrum_bb_with_balmer(None, temp_low=9000, for_tess=True)
+    I_lam_flare_for_tess = model._build_spectrum_bb_with_balmer(model._tess_waves, temp_low=9000)
     assert np.isclose(model._tess_band_integrate(I_lam_flare_for_tess), 0.0001229577732360932)
 
     sample = model.sample_parameters()
@@ -76,10 +81,9 @@ def test_mdwarf_flare_model_with_assigned_inputs():
     assert not check_if_monotonic(values[100])  # when flare should exist
 
     # check that the peak amp of the flare is the same as the amplitude that we put in
-
-    norm_shape = model._norm_flare_shape(times, t0, flare_fwhm) * flare_amplitude
-    I_flare_full = model._build_spectrum_bb_with_balmer(wavelengths, for_tess=False)
-    I_star_full = model._quiescent_flux_no_distance(star_temp, wavelengths, for_tess=False)
+    norm_shape = model._flare_model(times, t0, flare_fwhm) * flare_amplitude
+    I_flare_full = model._build_spectrum_bb_with_balmer(wavelengths)
+    I_star_full = model._quiescent_flux_no_distance(star_temp, wavelengths)
     integral_flare = model._tess_band_integrate(I_lam_flare_for_tess)
     integral_star = model._tess_band_integrate(I_lam_star_for_tess)
     constants = np.pi * star_radius**2 * u.sr * u.cm**2
@@ -104,6 +108,8 @@ def test_mdwarf_flare_model_with_assigned_inputs():
 
 def test_mdwarf_flare_model_parameter_sampling():
     """Test the sampling from parameter distributions for MDwarfFlareModel objects."""
+    if not check_connect_to_svo():
+        pytest.skip("Skipping test if we cannot connect to the SVO service.")
 
     model = MDwarfFlareModel(t0=10, node_label="model")
     state = model.sample_parameters(num_samples=1)
@@ -120,3 +126,35 @@ def test_mdwarf_flare_model_parameter_sampling():
     assert state["model"]["flare_fwhm"] > 0
     # flare_amp
     assert state["model"]["flare_amplitude"] > 0
+
+
+def test_mdwarf_flare_model_warnings():
+    """
+    Test we get a warning if we do not provide distance but provide redshift and cosmology.
+    """
+    if not check_connect_to_svo():
+        pytest.skip("Skipping test if we cannot connect to the SVO service.")
+
+    with pytest.warns(UserWarning):
+        _ = MDwarfFlareModel(
+            star_temp=4000,
+            star_radius=0.09 * u.R_sun.to(u.cm),
+            flare_fwhm=0.1,
+            flare_amplitude=0.03,
+            redshift=0.01,
+            cosmology=Planck18,
+            t0=10,
+        )
+
+    with warnings.catch_warnings():
+        # Treat all warnings inside this block as errors
+        warnings.simplefilter("error")
+
+        _ = MDwarfFlareModel(
+            star_temp=4000,
+            star_radius=0.09 * u.R_sun.to(u.cm),
+            flare_fwhm=0.1,
+            flare_amplitude=0.03,
+            t0=10,
+            distance=10.0,  # 10 parsec
+        )

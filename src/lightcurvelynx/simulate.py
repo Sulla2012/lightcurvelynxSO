@@ -1,6 +1,5 @@
 """The core functions for running the LightCurveLynx simulation."""
 
-import concurrent.futures
 import logging
 import warnings
 from pathlib import Path
@@ -13,7 +12,8 @@ from tqdm import tqdm
 from lightcurvelynx.astro_utils.spectrograph import Spectrograph
 from lightcurvelynx.obstable.obs_table import ObsTable
 from lightcurvelynx.survey_info import SurveyInfo
-from lightcurvelynx.utils.post_process_results import concat_results
+from lightcurvelynx.utils.parallelization_utils import JoblibExecutor, assert_safe_executor
+from lightcurvelynx.utils.post_process_results import concat_results, results_drop_empty
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +68,8 @@ class SimulationInfo:
         Whether to save the full filter names in the results (including survey prefix).
     progress_bar : bool
         Whether to show a progress bar during the simulation.
+    drop_empty_rows : bool
+        Whether to drop rows that have no observations after applying the filters.
     graph_state : GraphState, optional
         The predefined graph state to use to replay a previous simulation. If None,
         a new graph state is sampled.
@@ -91,6 +93,7 @@ class SimulationInfo:
         output_file_path=None,
         save_full_filter_names=False,
         progress_bar=True,
+        drop_empty_rows=False,
         graph_state=None,
         **kwargs,
     ):
@@ -110,6 +113,7 @@ class SimulationInfo:
         self.output_file_path = None
         self.save_full_filter_names = save_full_filter_names
         self.progress_bar = progress_bar
+        self.drop_empty_rows = drop_empty_rows
 
         if self.num_samples <= 0:
             raise ValueError("Number of samples must be a positive integer.")
@@ -210,6 +214,7 @@ class SimulationInfo:
                 output_file_path=batch_output_file_path,
                 save_full_filter_names=self.save_full_filter_names,
                 progress_bar=False,  # Don't show per-batch progress bars.
+                drop_empty_rows=self.drop_empty_rows,
                 graph_state=batch_graph_state,
                 **self.kwargs,
             )
@@ -453,9 +458,9 @@ def _simulate_lightcurves_batch(simulation_info):
             # Split on whether we are evaluating bandfluxes or spectra.
             if isinstance(passbands[survey_idx], Spectrograph):
                 # This is a spectrograph, so we compute the spectra for the spectra column.
-                sg_waves = passbands[survey_idx].query_waves
+                query_waves = passbands[survey_idx].query_waves
 
-                sed = model.evaluate_sed(obs_times, sg_waves, state, rng_info=rng)
+                sed = model.evaluate_sed(obs_times, query_waves, state, rng_info=rng)
                 measured_flux_perfect = passbands[survey_idx].evaluate(sed)
 
                 # Simulate spectrograph noise.
@@ -475,7 +480,7 @@ def _simulate_lightcurves_batch(simulation_info):
                 # We append each spectral as a separate entry in the spectra nested dictionary.
                 for obs_idx, obs_time in enumerate(obs_times):
                     spectra_dict["mjd"].append(obs_time)
-                    spectra_dict["waves"].append(sg_waves)
+                    spectra_dict["waves"].append(passbands[survey_idx].bin_centers)
                     spectra_dict["measured_flux_perfect"].append(measured_flux_perfect[obs_idx])
                     spectra_dict["measured_flux"].append(measured_flux[obs_idx])
                     spectra_dict["measured_flux_error"].append(measured_flux_error[obs_idx])
@@ -575,6 +580,11 @@ def _simulate_lightcurves_batch(simulation_info):
         spectra_frame = pd.DataFrame(data=spectra_dict, index=spectra_index)
         results = results.join_nested(spectra_frame, "spectra")
 
+    # Drop any rows that have neither lightcurve nor spectra data.
+    if simulation_info.drop_empty_rows:
+        results = results_drop_empty(results)
+
+    # If we are writing the subsets out to files, write this subset.
     if simulation_info.output_file_path is not None:
         results.to_parquet(simulation_info.output_file_path)
         return simulation_info.output_file_path
@@ -589,7 +599,7 @@ def _simulate_lightcurves_parallel(simulation_info, executor, batch_size=1_000):
     ----------
     simulation_info : SimulationInfo
         The information needed to perform simulate a single batch of results.
-    executor : concurrent.futures.Executor, optional
+    executor : concurrent.futures.Executor
         The executor object to use for parallel processing.
     batch_size : int, optional
         The number of samples to process in each batch when using multiprocessing.
@@ -602,6 +612,9 @@ def _simulate_lightcurves_parallel(simulation_info, executor, batch_size=1_000):
         for each object. Otherwise the NestedFrame is saved to a file and the function
         returns that file's path.
     """
+    # Check that the executor settings are safe for LightCurveLynx models.
+    assert_safe_executor(executor)
+
     # Perform the simulation in parallel batches (with a single progress bar) and
     # combine the results. Since different frameworks may return either Future
     # objects or direct results from the map function, we check for both.
@@ -640,6 +653,7 @@ def simulate_lightcurves(
     num_jobs=None,
     batch_size=100_000,
     save_full_filter_names=False,
+    drop_empty_rows=False,
     progress_bar=True,
     graph_state=None,
 ):
@@ -708,8 +722,11 @@ def simulate_lightcurves(
     num_jobs : int, optional
         If provided (and no executor is provided) creates a process pool (ProcessPoolExecutor)
         with the given number of workers to process the results.
+    drop_empty_rows : bool, optional
+        Whether to drop rows that have no observations. Default is False.
     batch_size : int, optional
-        The number of samples to process in each batch when using multiprocessing.
+        The number of samples to process in each batch. This applies both to serial and parallel
+        execution so that users can apply in-place filtering and file checkpoints during processing.
         Default is 100_000.
     save_full_filter_names : bool
         Whether to save the full filter names in the results (including survey prefix).
@@ -787,34 +804,52 @@ def simulate_lightcurves(
         param_cols=param_cols,
         output_file_path=output_file_path,
         save_full_filter_names=save_full_filter_names,
+        drop_empty_rows=drop_empty_rows,
         progress_bar=progress_bar,
         graph_state=graph_state,
     )
 
-    # If we are given a number of jobs, make sure the batch size is not larger than
-    # the number of samples per job.
-    if num_jobs is not None:
-        if num_jobs <= 0:  # pragma: no cover
-            raise ValueError("num_jobs must be a positive integer.")
-        if num_jobs > num_samples:  # pragma: no cover
-            num_jobs = num_samples
-        batch_size = np.min([batch_size, np.ceil(num_samples / num_jobs).astype(int)])
-        logger.info(f"Using num_jobs={num_jobs} and batch_size={batch_size} for parallel processing.")
+    # Compute the number of batches that will be needed, based on the batch size
+    # and number of samples.
+    if num_jobs is None:
+        num_jobs = 1  # Do this in serial.
+    elif num_jobs <= 0:  # pragma: no cover
+        raise ValueError("num_jobs must be a positive integer.")
+    batch_size = np.min([batch_size, np.ceil(num_samples / num_jobs).astype(int)])
+    num_batches = np.ceil(num_samples / batch_size).astype(int)
+    logger.info(f"Using num_jobs={num_jobs} and batch_size={batch_size} a total of {num_batches} batches.")
 
-    # If we do not have any parallelization information, perform in serial.
-    if executor is None and num_jobs is None:
-        return _simulate_lightcurves_batch(simulation_info)
-
-    # If we have an executor, use that.
+    # Run the simulations.
     if executor is not None:
+        # If we have an executor, use that regardless of the other settings.
         result_list = _simulate_lightcurves_parallel(simulation_info, executor, batch_size=batch_size)
+    elif num_batches == 1:
+        # We only have a single batch, so we can run it in serial.
+        result_list = [_simulate_lightcurves_batch(simulation_info)]
+    elif num_jobs == 1:
+        # We have multiple batches, but only one job, so we run them serially.
+        batches_list = simulation_info.split(batch_size=batch_size)
+        result_list = [_simulate_lightcurves_batch(batch) for batch in batches_list]
     else:
-        with concurrent.futures.ProcessPoolExecutor(max_workers=num_jobs) as executor:
-            result_list = _simulate_lightcurves_parallel(simulation_info, executor, batch_size=batch_size)
+        # We want to run in parallel, but did not provide and executor. We create a
+        # joblib executor with the specified number of jobs.
+        try:
+            from joblib import Parallel
+        except ImportError as err:
+            raise ImportError("joblib is required for parallel execution with JoblibExecutor.") from err
+
+        with Parallel(n_jobs=num_jobs, mmap_mode="c") as parallel:
+            result_list = _simulate_lightcurves_parallel(
+                simulation_info,
+                JoblibExecutor(parallel),
+                batch_size=batch_size,
+            )
 
     # If we returned the results directly, concatenate them into a single NestedFrame.
     # If we saved them to file, return the list of file paths.
-    if output_file_path is None:
+    if len(result_list) == 1:
+        results = result_list[0]
+    elif output_file_path is None:
         results = concat_results(result_list)
     else:
         results = result_list
