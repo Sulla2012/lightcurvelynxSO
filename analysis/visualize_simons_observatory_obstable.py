@@ -29,14 +29,21 @@ from lightcurvelynx.obstable.simons_observatory_obstable import (  # noqa: E402
     MAP_FIELDS,
     SIDE_NAMES,
     SIDEREAL_DAY_S,
+    SO_DAILY_DEPTH_MJY,
     SO_LONGITUDE_DEG,
+    SO_TUBE_BANDS,
     SO_TUBE_TYPES,
+    SPEED_OF_LIGHT_A_S,
     SimonsObservatoryObsTable,
+    add_bandflux_error,
+    daily_reference_exposure,
     point_visits,
     read_time_maps,
     simulate_downtime,
     simulate_time_maps,
     sky_to_pixel,
+    so_passbands,
+    sun_moon_cut,
     survey_epoch,
     tube_offsets,
     visit_schedule,
@@ -79,6 +86,13 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0, help="Random seed for the downtime realization.")
     parser.add_argument(
         "--epoch", type=float, help="Precession epoch (MJD); default is mid-way through the year."
+    )
+    parser.add_argument(
+        "--passbands",
+        type=Path,
+        nargs="+",
+        default=[Path("LAT_MF_median_bands.csv"), Path("LAT_UHF_median_bands.csv")],
+        help="Measured bandpass CSV files (frequency in GHz, median_<band> columns).",
     )
     parser.add_argument("--n-single", type=int, default=3, help="Tubes to plot individually.")
     parser.add_argument("--outdir", type=Path, default=Path("analysis/so_report"), help="Report directory.")
@@ -676,6 +690,141 @@ def plot_validation(time_maps, fname, n_sources=200):
     return {key: np.percentile(np.abs(v), [50, 90]) for key, v in errors.items()}
 
 
+def plot_passbands(files, fname):
+    """Plot the SO passbands (measured main lobes and LF top-hats) against frequency.
+
+    Parameters
+    ----------
+    files : list of Path
+        Measured bandpass CSV files passed to ``so_passbands``; missing files are skipped.
+    fname : Path
+        Output figure file.
+
+    Returns
+    -------
+    dict
+        Flat-weighted (bolometer) band center in GHz for each band.
+    """
+    group = so_passbands([f for f in files if f.exists()])
+    centers = {}
+    fig, ax = plt.subplots(figsize=(11, 3.5))
+    for name in sorted(group.filters):
+        passband = group[name]
+        nu = SPEED_OF_LIGHT_A_S / passband.waves / 1e9
+        nu_table = SPEED_OF_LIGHT_A_S / passband.transmission_table[:, 0] / 1e9
+        # Stored transmission is S * nu (see ghz_passband); divide it out to plot the response S.
+        response = passband.transmission_table[:, 1] / nu_table
+        centers[name] = float(passband.fluxes_to_bandflux(nu[None, :])[0])
+        # Close each band with zeros at its edges so top-hats are drawn as boxes.
+        nu_plot = np.r_[nu_table[0], nu_table, nu_table[-1]]
+        response_plot = np.r_[0.0, response / response.max(), 0.0]
+        (line,) = ax.plot(nu_plot, response_plot, label=f"{name} ({centers[name]:.1f} GHz)")
+        ax.axvline(centers[name], color=line.get_color(), ls=":", lw=0.8)
+    ax.set(xlabel="Frequency (GHz)", ylabel="Normalized response", xlim=(0, 340))
+    ax.legend(ncol=3, fontsize=8)
+    fig.savefig(fname, dpi=110, bbox_inches="tight")
+    plt.close(fig)
+    return centers
+
+
+def plot_sun_moon(time_maps, start, fname, block_days=30.0):
+    """Plot one year of sun and moon avoidance for the first simulated tube (no downtime).
+
+    Parameters
+    ----------
+    time_maps : dict
+        Time maps from ``simulate_time_maps``.
+    start : str
+        Survey start date (UTC).
+    fname : Path
+        Output figure file.
+    block_days : float
+        Visits are generated and cut in blocks of this many days (memory control).
+
+    Returns
+    -------
+    dict
+        Mean, 10% and 90% of the daily fraction of exposure cut.
+    """
+    tube = time_maps["tubes"][0]
+    tube_index = list(time_maps["tubes"]).index(tube)
+    maps = time_maps["maps"]
+    exposure = maps[MAP_FIELDS.index("exposure_s"), tube_index].reshape(2, -1)
+    dec, ra = np.degrees(np.asarray(maps.posmap()).reshape(2, -1))
+    start_mjd = survey_epoch(start)[0]
+    n_days = int(YEAR_DAYS)
+    total, cut_exposure = np.zeros(n_days), np.zeros(n_days)
+    seen, cut_days = np.zeros(ra.size), np.zeros(ra.size)
+    for block in np.arange(0.0, YEAR_DAYS, block_days):
+        length = min(block_days, YEAR_DAYS - block)
+        for side in range(2):
+            visits = visit_schedule(time_maps, tube, side, start_mjd + block, length)
+            pix, time = visits["pixel"], visits["time"]
+            cut = sun_moon_cut(time, ra[pix], dec[pix])
+            day = np.clip(np.floor(time - start_mjd).astype(int), 0, n_days - 1)
+            np.add.at(total, day, exposure[side, pix])
+            np.add.at(cut_exposure, day, exposure[side, pix] * cut)
+            np.add.at(seen, pix, 1)
+            np.add.at(cut_days, pix, cut)
+    fraction = cut_exposure / np.maximum(total, 1e-9)
+    fig, axes = plt.subplots(1, 2, figsize=(14, 3.6), gridspec_kw={"width_ratios": [1, 1.6]})
+    axes[0].plot(np.arange(n_days), fraction, lw=0.7)
+    axes[0].axhline(fraction.mean(), color="k", ls=":", lw=0.8)
+    axes[0].set(xlabel=f"Day since {start}", ylabel="Fraction of exposure cut", ylim=(0, None))
+    image = np.where(seen > 0, cut_days / np.maximum(seen, 1), np.nan).reshape(maps.shape[-2:])
+    artist = sky_imshow(axes[1], image, maps, cmap="Reds", vmin=0)
+    fig.colorbar(artist, ax=axes[1], label="Fraction of visits cut")
+    axes[1].set_title(f"Tube {tube}")
+    fig.savefig(fname, dpi=110, bbox_inches="tight")
+    plt.close(fig)
+    return {"mean": fraction.mean(), "p10": np.percentile(fraction, 10), "p90": np.percentile(fraction, 90)}
+
+
+def plot_noise(table, time_maps, fname):
+    """Plot single-visit flux errors and the one-day depth they combine to, per band.
+
+    The one-day depth combines a pixel's visits on one transit day (inverse variance) over the
+    simulated tubes, then is extrapolated to all of the band's tubes by sqrt(n_simulated / n_tubes).
+
+    Parameters
+    ----------
+    table : SimonsObservatoryObsTable
+        Table with a ``bandflux_error`` column (nJy).
+    time_maps : dict
+        Time maps the table was built from.
+    fname : Path
+        Output figure file.
+
+    Returns
+    -------
+    dict
+        Per band: (median single-visit error, extrapolated one-day depth), both in mJy.
+    """
+    df = table._table.assign(ivar=lambda d: 1.0 / d["bandflux_error"] ** 2)
+    kind = {band: k for k, bands in SO_TUBE_BANDS.items() for band in bands}
+    simulated = {k: sum(SO_TUBE_TYPES[t] == k for t in time_maps["tubes"]) for k in SO_TUBE_BANDS}
+    combined = df.groupby(["filter", "pixel_index", "transit_day"], observed=True)["ivar"].sum()
+    bands = [b for b in SO_DAILY_DEPTH_MJY if b in set(df["filter"])]
+    stats = {}
+    fig, axes = plt.subplots(1, 2, figsize=(13, 3.6))
+    for band in bands:
+        errors = df.loc[df["filter"] == band, "bandflux_error"].to_numpy() / 1e6
+        axes[0].hist(errors, bins=np.geomspace(1, 300, 60), histtype="step", label=band)
+        extrapolate = np.sqrt(simulated[kind[band]] / SO_TUBE_TYPES.count(kind[band]))
+        depth = np.median(1e-6 / np.sqrt(combined.loc[band].to_numpy())) * extrapolate
+        stats[band] = (np.median(errors), depth)
+    axes[0].set(xscale="log", xlabel="Single-visit flux error (mJy)", ylabel="Rows")
+    axes[0].legend(fontsize=8)
+    x = np.arange(len(bands))
+    axes[1].bar(x - 0.2, [SO_DAILY_DEPTH_MJY[b] for b in bands], 0.4, label="nominal one-day depth")
+    axes[1].bar(x + 0.2, [stats[b][1] for b in bands], 0.4, label="simulated (median pixel-day)")
+    axes[1].set(xticks=x, xticklabels=bands, ylabel="1-sigma depth (mJy)")
+    axes[1].legend(fontsize=8)
+    fig.savefig(fname, dpi=110, bbox_inches="tight")
+    plt.close(fig)
+    return stats
+
+
 def write_report(outdir, figures, summary):
     """Write the HTML report referencing the figures.
 
@@ -724,6 +873,12 @@ UHF: f220/f280).</li>
 <li>Sun and moon avoidance: visits within 30&deg; of the sun or moon are dropped. <b>Assumption:</b> the
 scheduler re-points instead of idling, so the exposure cut each day is redistributed uniformly over that
 tube's remaining visits (<code>exposure_scale</code>); total observing time is unchanged.</li>
+<li>Passbands: measured MF/UHF bandpasses (main lobe above 40 GHz) and LF top-hats; band fluxes use flat
+(bolometer) frequency weighting.</li>
+<li>Noise: per-visit error = one-day map depth (mJy; 37/25/6.9/8.3/26/49 at f030&ndash;f280) &times;
+sqrt(T_day / exposure), with T_day the band's typical one-day exposure over all its tubes.</li>
+<li><b>Assumption:</b> tube indices 1&ndash;6 and 7&ndash;12 follow i1&ndash;i6 and o1&ndash;o6 in the
+rotational order of <code>tube_offsets</code>; the real focal-plane orientation is unchecked.</li>
 <li>Pointings are precessed (IAU 2006) from the mean equator and equinox of one epoch, mid-way through
 the year, to ICRS; over a multi-year survey this drifts by ~0.014&deg; per year. Refraction (~0.01&deg;
 at 40&deg; elevation), nutation and aberration (&lt;0.006&deg;) are ignored.</li>
@@ -749,6 +904,7 @@ def main():
     table = SimonsObservatoryObsTable.from_time_maps(
         time_maps, args.start, args.days, first_side=args.first_side
     )
+    add_bandflux_error(table, time_maps)
     print(f"Built ObsTable with {len(table):,} rows")
 
     prefix = "debug_" if args.debug else ""
@@ -781,6 +937,40 @@ def main():
         " ~2 minutes.",
         plot_validation,
         time_maps,
+    )
+    noise = add(
+        "noise",
+        "Noise: single-visit errors and one-day depth",
+        "Left: per-visit flux errors, depth &times; sqrt(T_day / exposure_s), where T_day is the band's"
+        " typical one-day exposure summed over all its tubes. Right: combining each pixel's visits on one"
+        " transit day reproduces the nominal one-day depths (bands are extrapolated from the simulated tubes"
+        " to all of the band's tubes). The sun/moon cut is on, so the observed sky is a few percent deeper"
+        " than nominal: the avoided time is given to the rest of the sky.",
+        plot_noise,
+        table,
+        time_maps,
+    )
+    centers = add(
+        "passbands",
+        "Passbands",
+        "Measured bandpasses (main lobe above 40 GHz, response &gt; 1% of peak) and LF top-hats (f030: 27.9"
+        " &plusmn; 2.35 GHz, f040: 40.2 &plusmn; 8.45 GHz). Dotted lines: band centers with flat (bolometer)"
+        " frequency weighting, which is what the simulated band fluxes use.",
+        plot_passbands,
+        args.passbands,
+    )
+    print("Computing one year of sun/moon avoidance...", flush=True)
+    avoidance = add(
+        "sun_moon",
+        "Sun and moon avoidance over one year",
+        "Visits within 30&deg; of the sun or moon are dropped (no downtime here). Left: fraction of the"
+        " tube's daily exposure cut; the monthly peaks are the moon crossing the scanned declinations. Right:"
+        " fraction of each pixel's visits cut. <b>Assumption:</b> the scheduler re-points rather than idles,"
+        " so the cut exposure is given to the tube's remaining visits that day (<code>exposure_scale</code>)"
+        " and the total observing time is unchanged.",
+        plot_sun_moon,
+        time_maps,
+        args.start,
     )
     titles = {
         "hits": "Hits",
@@ -835,8 +1025,8 @@ def main():
         "From left: fraction of the full sky observed on each UTC day (grey: no downtime); area-weighted"
         " days per year each footprint pixel is observed (dotted: no downtime); area-weighted revisit"
         " gaps between observed transit days (one sidereal day when nothing is lost; longer gaps come from"
-        " downtime and edge pixels seen on one crossing only); days observed per year, any band. Sun/moon"
-        " avoidance is not modeled.",
+        " downtime and edge pixels seen on one crossing only); days observed per year, any band. These panels"
+        " exclude the sun/moon cut, which is shown separately.",
         plot_year_coverage,
         time_maps,
         ideal,
@@ -913,6 +1103,17 @@ def main():
         )
     for key, (p50, p90) in errors.items():
         summary[f"Pixelization |error| in {key}: median / 90%"] = f"{p50:.2f} / {p90:.2f}"
+    summary["Sun/moon cut: daily exposure fraction mean (10-90%)"] = (
+        f"{avoidance['mean']:.3f} ({avoidance['p10']:.3f}-{avoidance['p90']:.3f})"
+    )
+    reference = daily_reference_exposure(time_maps)
+    for band, (single, depth) in noise.items():
+        summary[
+            f"{band}: center (GHz) / T_day (s) / median visit error / one-day depth sim vs nominal (mJy)"
+        ] = (
+            f"{centers.get(band, float('nan')):.1f} / {reference[band]:.1f} / {single:.1f} / "
+            f"{depth:.1f} vs {SO_DAILY_DEPTH_MJY[band]:g}"
+        )
     write_report(args.outdir, entries, summary)
     print(f"Wrote {args.outdir / 'report.html'}")
 
