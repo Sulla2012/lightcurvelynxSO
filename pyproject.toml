@@ -53,6 +53,7 @@ dev = [
     "modeldag",
     "mosfit>=2.1",  # Used for physical models of transients
     "networkx",  # Used for graph visualization
+    "afterglowpy",  # Used for GRB afterglow models
     "pixell",  # Used for Simons Observatory scan maps
     "pre-commit", # Used to run checks before finalizing a git commit
     "pytest",
@@ -73,6 +74,7 @@ all = [
     "lsdb>=0.10.2",  # Used to read and write LSDB catalogs
     "mosfit>=2.1",  # Used for physical models of transients
     "networkx",  # Used for graph visualization
+    "afterglowpy",  # Used for GRB afterglow models
     "pixell",  # Used for Simons Observatory scan maps
     "pzflow>=4.0",
     "synphot",  # used for SED modeling tests

@@ -38,6 +38,8 @@ Idealized scan model
 * Each pixel is therefore observed at most once per tube per sidereal day.
 """
 
+import functools
+
 import erfa
 import numpy as np
 import pandas as pd
@@ -906,19 +908,65 @@ def sun_moon_cut(time_mjd, ra_deg, dec_deg, avoid_deg=SO_AVOID_DEG, step_min=10.
     time_mjd, ra_deg, dec_deg = (np.asarray(v, dtype=float) for v in (time_mjd, ra_deg, dec_deg))
     if len(time_mjd) == 0:
         return np.zeros(0, dtype=bool)
-    step = step_min / 1440.0
-    grid = np.arange(time_mjd.min(), time_mjd.max() + step, step)
-    site = EarthLocation.from_geodetic(SO_LONGITUDE_DEG, SO_LATITUDE_DEG, height=5200.0)
-    index = np.rint((time_mjd - grid[0]) / step).astype(int)
+    # The grid spans whole UTC days so repeated calls over the same dates reuse cached positions.
+    first_day, last_day = int(np.floor(time_mjd.min())), int(np.floor(time_mjd.max())) + 1
+    grid0, step, positions = body_positions(first_day, last_day, step_min)
+    index = np.rint((time_mjd - grid0) / step).astype(int)
     too_close = np.zeros(len(time_mjd), dtype=bool)
-    for body in ("sun", "moon"):
-        pos = get_body(body, Time(grid, format="mjd"), site)
-        sep = angular_separation_deg(ra_deg, dec_deg, pos.ra.deg[index], pos.dec.deg[index])
-        too_close |= sep < avoid_deg
+    for ra_body, dec_body in positions:
+        too_close |= angular_separation_deg(ra_deg, dec_deg, ra_body[index], dec_body[index]) < avoid_deg
     return too_close
 
 
-def conserve_exposure(table, cut):
+@functools.lru_cache(maxsize=8)
+def body_positions(first_day, last_day, step_min):
+    """Return topocentric sun and moon positions at the SO site on a regular time grid (cached).
+
+    Parameters
+    ----------
+    first_day, last_day : int
+        Grid range in whole MJD days, [first_day, last_day].
+    step_min : float
+        Grid step in minutes.
+
+    Returns
+    -------
+    grid0 : float
+        MJD of the first grid point.
+    step : float
+        Grid step in days.
+    positions : tuple
+        ((ra, dec) of the sun, (ra, dec) of the moon) in degrees on the grid.
+    """
+    step = step_min / 1440.0
+    grid = np.arange(first_day, last_day + step, step)
+    site = EarthLocation.from_geodetic(SO_LONGITUDE_DEG, SO_LATITUDE_DEG, height=5200.0)
+    bodies = (get_body(body, Time(grid, format="mjd"), site) for body in ("sun", "moon"))
+    return grid[0], step, tuple((pos.ra.deg, pos.dec.deg) for pos in bodies)
+
+
+def daily_exposure_scale(table, cut):
+    """Return the factor that restores each tube's daily exposure after dropping ``cut`` visits.
+
+    Parameters
+    ----------
+    table : pandas.DataFrame
+        Visit table with ``time`` (MJD), ``tube_id`` and ``exposure_s`` columns.
+    cut : numpy.ndarray
+        Boolean array, True for visits to drop.
+
+    Returns
+    -------
+    pandas.Series
+        ``total / kept`` exposure indexed by (``tube_id``, UTC day as floor(MJD)); infinite on a
+        day where every visit of a tube is cut.
+    """
+    exposure = table["exposure_s"].astype(float)
+    group = [table["tube_id"].rename("tube_id"), np.floor(table["time"]).rename("day")]
+    return exposure.groupby(group).sum() / exposure.where(~cut, 0.0).groupby(group).sum()
+
+
+def conserve_exposure(table, cut, scale=None):
     """Drop cut visits and give their exposure to the remaining visits of the same tube and day.
 
     This implements the assumption that sun and moon avoidance re-points the telescope rather than
@@ -933,22 +981,25 @@ def conserve_exposure(table, cut):
         Visit table with ``time`` (MJD), ``tube_id`` and ``exposure_s`` columns.
     cut : numpy.ndarray
         Boolean array, True for visits to drop.
+    scale : pandas.Series, optional
+        Precomputed ``daily_exposure_scale``, e.g. estimated from the full sky when ``table`` only
+        holds a few pixels. Defaults to the scale computed from ``table`` itself; (tube, day)
+        pairs missing from ``scale`` get 1.
 
     Returns
     -------
     pandas.DataFrame
         The surviving visits with rescaled ``exposure_s`` and the ``exposure_scale`` column.
     """
-    group = [table["tube_id"].to_numpy(), np.floor(table["time"].to_numpy())]
-    exposure = table["exposure_s"].astype(float)
-    total = exposure.groupby(group).transform("sum")
-    kept = exposure.where(~cut, 0.0).groupby(group).transform("sum")
-    table = table.assign(exposure_scale=(total / kept).astype(np.float32))[~cut]
+    scale = daily_exposure_scale(table, cut) if scale is None else scale
+    keys = pd.MultiIndex.from_arrays([table["tube_id"], np.floor(table["time"])])
+    factor = scale.reindex(keys).fillna(1.0).to_numpy()
+    table = table.assign(exposure_scale=factor.astype(np.float32))[~cut]
     table["exposure_s"] = (table["exposure_s"] * table["exposure_scale"]).astype(np.float32)
     return table.reset_index(drop=True)
 
 
-def visit_schedule(time_maps, tube, side, start_date, n_days, *, first_side=0, downtime=None):
+def visit_schedule(time_maps, tube, side, start_date, n_days, *, first_side=0, downtime=None, pixels=None):
     """Return the visits of one tube on one scan side over a date range.
 
     Successive meridian transits of each pixel alternate between its rising (east) and setting
@@ -970,6 +1021,8 @@ def visit_schedule(time_maps, tube, side, start_date, n_days, *, first_side=0, d
         Scan side for transits on the sidereal day (from LST = 0) containing the start.
     downtime : numpy.ndarray, optional
         Merged downtime intervals (MJD); visits overlapping them are dropped.
+    pixels : numpy.ndarray, optional
+        Flat map pixel indices to restrict the visits to. Defaults to all observed pixels.
 
     Returns
     -------
@@ -981,7 +1034,8 @@ def visit_schedule(time_maps, tube, side, start_date, n_days, *, first_side=0, d
     start_mjd, lst0_mjd = survey_epoch(start_date)
     sub = maps[:, list(time_maps["tubes"]).index(tube), side].reshape(len(MAP_FIELDS), -1)
     fields = dict(zip(MAP_FIELDS, sub, strict=True))
-    pixels = np.flatnonzero(fields["hits"] > 0)
+    observed = np.flatnonzero(fields["hits"] > 0)
+    pixels = observed if pixels is None else np.intersect1d(observed, pixels)
     ra = np.degrees(np.asarray(maps.posmap())[1]).ravel()[pixels]
     days = np.arange(-1, int(np.ceil(n_days * 86400.0 / SIDEREAL_DAY_S)) + 2)
     time_s = days[:, None] * SIDEREAL_DAY_S + fields["time_s"][pixels][None, :]
@@ -1110,6 +1164,10 @@ class SimonsObservatoryObsTable(ObsTable):
         first_side=0,
         downtime=None,
         avoid_deg=SO_AVOID_DEG,
+        pixels=None,
+        n_scale_pixels=3000,
+        seed=0,
+        scale=None,
         **kwargs,
     ):
         """Materialize simulated time maps into an ObsTable over a date range.
@@ -1143,6 +1201,16 @@ class SimonsObservatoryObsTable(ObsTable):
             redistributed over the tube's remaining visits that day by ``conserve_exposure``, so
             total observing time is unchanged (an assumption; see the module docstring). None
             disables the cut and the rescaling.
+        pixels : array_like, optional
+            Flat map pixel indices to build rows for, e.g. the pixels containing simulated sources.
+            This keeps long surveys small. The sun/moon rescaling must reflect each tube's whole
+            day, so it is then estimated from ``n_scale_pixels`` random observed pixels.
+        n_scale_pixels : int
+            Number of random pixels used to estimate the rescaling when ``pixels`` is given.
+        seed : int
+            Random seed for choosing those pixels.
+        scale : pandas.Series, optional
+            Precomputed ``avoidance_scale`` to reuse across several pixel subsets.
         **kwargs
             Additional survey values passed to the constructor.
 
@@ -1160,7 +1228,14 @@ class SimonsObservatoryObsTable(ObsTable):
         for tube, side in ((tube, side) for tube in tubes for side in range(2)):
             bands = list(band_names[SO_TUBE_TYPES[tube]])
             visits = visit_schedule(
-                time_maps, tube, side, start_date, n_days, first_side=first_side, downtime=downtime
+                time_maps,
+                tube,
+                side,
+                start_date,
+                n_days,
+                first_side=first_side,
+                downtime=downtime,
+                pixels=pixels,
             )
             # One row per (visit, band): repeat every visit for each band of the tube.
             band_codes = np.repeat(np.arange(len(bands)), len(visits["pixel"]))
@@ -1192,13 +1267,67 @@ class SimonsObservatoryObsTable(ObsTable):
         dec, ra = np.degrees(np.asarray(maps.posmap()).reshape(2, -1)[:, table["pixel_index"].to_numpy()])
         table["ra"], table["dec"] = ra % 360.0, dec
         if avoid_deg is not None:
-            table = conserve_exposure(
-                table, sun_moon_cut(table["time"], table["ra"], table["dec"], avoid_deg)
-            )
+            if scale is None and pixels is not None:
+                args = (time_maps, start_date, n_days, tubes, first_side, downtime, avoid_deg)
+                scale = cls.avoidance_scale(*args, n_scale_pixels, seed)
+            cut = sun_moon_cut(table["time"], table["ra"], table["dec"], avoid_deg)
+            table = conserve_exposure(table, cut, scale)
         kwargs.setdefault("radius", time_maps["res_deg"] / np.sqrt(2.0))
         kwargs.setdefault("scan_elevation_deg", time_maps["elevation_deg"])
         kwargs.setdefault("fov_deg", time_maps["fov_deg"])
         return cls(table, map_shape=maps.shape, map_wcs=maps.wcs, **kwargs)
+
+    @classmethod
+    def avoidance_scale(
+        cls, time_maps, start_date, n_days, tubes, first_side, downtime, avoid_deg, n_pixels, seed
+    ):
+        """Estimate each tube's daily sun/moon exposure rescaling from random observed pixels.
+
+        Parameters
+        ----------
+        time_maps : dict
+            Output of ``simulate_time_maps`` or ``read_time_maps``.
+        start_date : str or float
+            Survey start as an ISO date string (UTC) or MJD.
+        n_days : float
+            Survey length in days.
+        tubes : list of int
+            Tubes to estimate the rescaling for.
+        first_side : int
+            Scan side for transits on the sidereal day containing the start.
+        downtime : numpy.ndarray or None
+            Downtime intervals (MJD).
+        avoid_deg : float
+            Sun and moon avoidance radius in degrees.
+        n_pixels : int
+            Number of random observed pixels to use.
+        seed : int
+            Random seed.
+
+        Returns
+        -------
+        pandas.Series
+            ``daily_exposure_scale`` indexed by (``tube_id``, UTC day).
+        """
+        observed = np.flatnonzero(np.asarray(time_maps["maps"][MAP_FIELDS.index("hits")]).sum((0, 1)) > 0)
+        sample = np.random.default_rng(seed).choice(observed, min(n_pixels, len(observed)), replace=False)
+        one_band = {kind: bands[:1] for kind, bands in SO_TUBE_BANDS.items()}
+        scales = []
+        for tube in tubes:
+            reference = cls.from_time_maps(
+                time_maps,
+                start_date,
+                n_days,
+                tubes=[tube],
+                band_names=one_band,
+                first_side=first_side,
+                downtime=downtime,
+                avoid_deg=None,
+                pixels=sample,
+            )._table
+            cut = sun_moon_cut(reference["time"], reference["ra"], reference["dec"], avoid_deg)
+            scales.append(daily_exposure_scale(reference, cut))
+        return pd.concat(scales)
 
     def copy(self):
         """Create a copy of the table that retains its SO-specific spatial lookup."""

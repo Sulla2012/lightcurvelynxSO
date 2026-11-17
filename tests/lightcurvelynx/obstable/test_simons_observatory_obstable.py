@@ -387,3 +387,17 @@ def test_bandflux_error(time_maps, table):
         # A visit with the full daily exposure would reach the daily depth (nJy); noise ~ 1/sqrt(t).
         depth = rows["bandflux_error"] * np.sqrt(rows["exposure_s"] / reference[band])
         np.testing.assert_allclose(depth, SO_DAILY_DEPTH_MJY[band] * 1e6, rtol=1e-5)
+
+
+def test_pixel_subset(time_maps, table):
+    """A pixel subset keeps exactly those rows, with the full-sky sun/moon rescaling."""
+    df = table._table
+    pixels = np.unique(df["pixel_index"])[::7]
+    sub = SimonsObservatoryObsTable.from_time_maps(
+        time_maps, START, 3, pixels=pixels, n_scale_pixels=100000
+    )._table
+    full = df[df["pixel_index"].isin(pixels)]
+    keys = ["tube_id", "filter", "pixel_index", "time"]
+    merged = full.merge(sub, on=keys, suffixes=("_full", "_sub"), validate="one_to_one")
+    assert len(merged) == len(full) == len(sub)
+    np.testing.assert_allclose(merged["exposure_s_full"], merged["exposure_s_sub"], rtol=1e-5)

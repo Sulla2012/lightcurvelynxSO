@@ -154,3 +154,4 @@ _html/
 src/lightcurvelynx/astro_utils/passbands/*
 data/*
 docs/notebooks/scratch
+analysis/grb_report/
